@@ -6,10 +6,25 @@ import {
   Upload, Trash2, FileText, Target, Zap, Calculator, 
   Crosshair, Shield, Clock, Award, Ban, HelpCircle
 } from 'lucide-react';
+import { createWorker } from 'tesseract.js';
+import { computeRiskProfile } from './src/engine/riskCalculator';
+import { evaluateEventRisk } from './src/engine/eventRisk';
+import { computePositionSize } from './src/engine/positionSizer';
+import { validateTradePlan } from './src/engine/tradePlanValidator';
+import { DEFAULT_SCHEDULE, getTradingGate } from './src/engine/tradingGate';
+import { emptySnapshot, parseIbkrPortfolioText } from './src/engine/ibkrOcrParser';
+import { computePortfolioRiskScore } from './src/engine/portfolioRiskScore';
+import { FieldHelp, HelpIcon } from './src/ui/FieldHelp';
 
 export default function App() {
   // --- STATE ---
-  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard', 'archive', 'blueprint'
+  // state = portfolio/market snapshot · tools = plan/size/actions · archive · blueprint
+  const [activeTab, setActiveTab] = useState('state');
+  const [nowTick, setNowTick] = useState(() => new Date());
+  /** Planning: size & validate anytime. Live: enforce approved windows for execution. */
+  const [workspaceMode, setWorkspaceMode] = useState('planning');
+  const [watchlist, setWatchlist] = useState([]); // { id, ticker, note, setupGrade }
+  const [watchNote, setWatchNote] = useState('');
   
   // Equity & Risk State
   const [peakEquity, setPeakEquity] = useState(189036); 
@@ -26,6 +41,16 @@ export default function App() {
   // Daily Realized P&L Tracker (For Q1 and Daily Limits)
   const [dailyRealizedPL, setDailyRealizedPL] = useState(0); // Input in dollars
   const [unrealizedOpenRisk, setUnrealizedOpenRisk] = useState(0); // For visualizing active open risk (in R)
+  const [unrealizedPL, setUnrealizedPL] = useState(0);
+  const [excessLiquidity, setExcessLiquidity] = useState(0);
+  const [buyingPower, setBuyingPower] = useState(0);
+  const [maintMargin, setMaintMargin] = useState(0);
+  const [positions, setPositions] = useState([]); // { ticker, last, qty, pnl }
+  const [snapshotImportedAt, setSnapshotImportedAt] = useState(null);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrError, setOcrError] = useState('');
+  const [ocrDraft, setOcrDraft] = useState(null); // editable review snapshot
 
   // Mistake & Process Tracking State (SMB Capital 5 W's Model)
   const [executionType, setExecutionType] = useState('perfect'); // 'perfect' or 'mistake'
@@ -37,10 +62,34 @@ export default function App() {
   const [dailyNotes, setDailyNotes] = useState('');
   const [journalDate, setJournalDate] = useState(new Date().toISOString().split('T')[0]); // Default to today (YYYY-MM-DD)
   const [routine, setRoutine] = useState({
-    journal: false, alerts: false, orders: false, // 5:00 AM Prep
-    handsOff: false, // 4:30 PM Market Hours
-    reviewPos: false, moveStops: false // 11:00 PM Close
+    snapshotImported: false, // Start-of-day IBKR OCR
+    journal: false, alerts: false, orders: false,
+    handsOff: false,
+    reviewPos: false, moveStops: false
   });
+
+  // Trading schedule + pre-trade guardrails
+  const [tradingSchedule, setTradingSchedule] = useState(DEFAULT_SCHEDULE);
+  const [tradeTicker, setTradeTicker] = useState('');
+  const [earningsChecked, setEarningsChecked] = useState(false);
+  const [earningsTiming, setEarningsTiming] = useState('unknown');
+  const [eventNotes, setEventNotes] = useState('');
+  const [highImpactEventPending, setHighImpactEventPending] = useState(false);
+  const [highImpactEventApproved, setHighImpactEventApproved] = useState(false);
+  const [setupGrade, setSetupGrade] = useState('no_trade');
+  const [entryPrice, setEntryPrice] = useState(0);
+  const [stopPrice, setStopPrice] = useState(0);
+  const [originalStop, setOriginalStop] = useState(0);
+  const [tradeDirection, setTradeDirection] = useState('long');
+  const [isAdd, setIsAdd] = useState(false);
+  const [addType, setAddType] = useState('not_allowed');
+  const [addPrePlanned, setAddPrePlanned] = useState(false);
+  const [positionIsLosing, setPositionIsLosing] = useState(false);
+  const [combinedRiskR, setCombinedRiskR] = useState(1);
+  const [unrealizedGainPct, setUnrealizedGainPct] = useState(0);
+  const [unrealizedR, setUnrealizedR] = useState(0);
+  const [profitProtectionPlan, setProfitProtectionPlan] = useState('none');
+  const [requestedShares, setRequestedShares] = useState(0);
 
   // Archive History
   const [history, setHistory] = useState([]);
@@ -54,6 +103,7 @@ export default function App() {
     const savedManualTier = localStorage.getItem('pelegManualRiskTier');
     const savedQqq = localStorage.getItem('pelegQqqStatus');
     const savedSpy = localStorage.getItem('pelegSpyStatus');
+    const savedGate = localStorage.getItem('pelegTradeGateConfig');
 
     if (savedHistory) {
       try { setHistory(JSON.parse(savedHistory)); } catch (e) { console.error('Failed to parse history'); }
@@ -64,6 +114,45 @@ export default function App() {
     if (savedManualTier) setManualRiskTier(savedManualTier);
     if (savedQqq) setQqqStatus(savedQqq);
     if (savedSpy) setSpyStatus(savedSpy);
+    if (savedGate) {
+      try {
+        const g = JSON.parse(savedGate);
+        if (g.tradingSchedule) setTradingSchedule(g.tradingSchedule);
+        if (g.tradeTicker != null) setTradeTicker(g.tradeTicker);
+        if (g.earningsChecked != null) setEarningsChecked(g.earningsChecked);
+        if (g.earningsTiming) setEarningsTiming(g.earningsTiming);
+        if (g.eventNotes != null) setEventNotes(g.eventNotes);
+        if (g.highImpactEventPending != null) setHighImpactEventPending(g.highImpactEventPending);
+        if (g.highImpactEventApproved != null) setHighImpactEventApproved(g.highImpactEventApproved);
+        if (g.setupGrade) setSetupGrade(g.setupGrade);
+        if (g.entryPrice != null) setEntryPrice(Number(g.entryPrice));
+        if (g.stopPrice != null) setStopPrice(Number(g.stopPrice));
+        if (g.originalStop != null) setOriginalStop(Number(g.originalStop));
+        if (g.tradeDirection) setTradeDirection(g.tradeDirection);
+        if (g.isAdd != null) setIsAdd(g.isAdd);
+        if (g.addType) setAddType(g.addType);
+        if (g.addPrePlanned != null) setAddPrePlanned(g.addPrePlanned);
+        if (g.positionIsLosing != null) setPositionIsLosing(g.positionIsLosing);
+        if (g.combinedRiskR != null) setCombinedRiskR(Number(g.combinedRiskR));
+        if (g.unrealizedGainPct != null) setUnrealizedGainPct(Number(g.unrealizedGainPct));
+        if (g.unrealizedR != null) setUnrealizedR(Number(g.unrealizedR));
+        if (g.profitProtectionPlan) setProfitProtectionPlan(g.profitProtectionPlan);
+        if (g.requestedShares != null) setRequestedShares(Number(g.requestedShares));
+        if (g.workspaceMode) setWorkspaceMode(g.workspaceMode);
+        if (Array.isArray(g.watchlist)) setWatchlist(g.watchlist);
+        if (g.unrealizedPL != null) setUnrealizedPL(Number(g.unrealizedPL));
+        if (g.excessLiquidity != null) setExcessLiquidity(Number(g.excessLiquidity));
+        if (g.buyingPower != null) setBuyingPower(Number(g.buyingPower));
+        if (g.maintMargin != null) setMaintMargin(Number(g.maintMargin));
+        if (Array.isArray(g.positions)) setPositions(g.positions);
+        if (g.snapshotImportedAt) setSnapshotImportedAt(g.snapshotImportedAt);
+        if (g.routine) setRoutine((prev) => ({ ...prev, ...g.routine }));
+        if (g.unrealizedOpenRisk != null) setUnrealizedOpenRisk(Number(g.unrealizedOpenRisk));
+        if (g.dailyRealizedPL != null) setDailyRealizedPL(Number(g.dailyRealizedPL));
+      } catch (e) {
+        console.error('Failed to parse trade gate config');
+      }
+    }
   }, []);
 
   // Save changes to localStorage
@@ -79,46 +168,155 @@ export default function App() {
   useEffect(() => { localStorage.setItem('pelegQqqStatus', qqqStatus); }, [qqqStatus]);
   useEffect(() => { localStorage.setItem('pelegSpyStatus', spyStatus); }, [spyStatus]);
 
-  // --- MATH ENGINE ---
-  const drawdown = peakEquity > 0 ? ((peakEquity - currentEquity) / peakEquity) * 100 : 0;
-  
-  let strictTier = 0; 
-  if (drawdown >= 15) strictTier = 3;
-  else if (drawdown >= 10) strictTier = 2;
-  else if (drawdown >= 5) strictTier = 1;
+  useEffect(() => {
+    const gateConfig = {
+      tradingSchedule,
+      tradeTicker,
+      earningsChecked,
+      earningsTiming,
+      eventNotes,
+      highImpactEventPending,
+      highImpactEventApproved,
+      setupGrade,
+      entryPrice,
+      stopPrice,
+      originalStop,
+      tradeDirection,
+      isAdd,
+      addType,
+      addPrePlanned,
+      positionIsLosing,
+      combinedRiskR,
+      unrealizedGainPct,
+      unrealizedR,
+      profitProtectionPlan,
+      requestedShares,
+      workspaceMode,
+      watchlist,
+      unrealizedPL,
+      excessLiquidity,
+      buyingPower,
+      maintMargin,
+      positions,
+      snapshotImportedAt,
+      routine,
+      unrealizedOpenRisk,
+      dailyRealizedPL,
+    };
+    localStorage.setItem('pelegTradeGateConfig', JSON.stringify(gateConfig));
+  }, [
+    tradingSchedule, tradeTicker, earningsChecked, earningsTiming, eventNotes,
+    highImpactEventPending, highImpactEventApproved, setupGrade, entryPrice, stopPrice,
+    originalStop, tradeDirection, isAdd, addType, addPrePlanned, positionIsLosing,
+    combinedRiskR, unrealizedGainPct, unrealizedR, profitProtectionPlan, requestedShares,
+    workspaceMode, watchlist, unrealizedPL, excessLiquidity, buyingPower, maintMargin,
+    positions, snapshotImportedAt, routine, unrealizedOpenRisk, dailyRealizedPL,
+  ]);
 
-  let activeTier = strictTier;
-  let isRecoveryMode = false;
-  if (manualRiskTier !== 'auto') {
-    activeTier = Number(manualRiskTier);
-    isRecoveryMode = true;
-  }
+  // Refresh clock for live gate status
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(new Date()), 30000);
+    return () => clearInterval(id);
+  }, []);
 
-  let riskPercent = 1.0;
-  let riskStatus = { level: 0, risk: '1.0% - 1.5%', margin: true, maxPos: 'Portfolio Size', color: 'bg-green-100 text-green-800 border-green-300' };
-  
-  if (activeTier === 3) {
-    riskPercent = 0;
-    riskStatus = { level: 3, risk: '0%', margin: false, maxPos: '0', color: 'bg-red-100 text-red-800 border-red-300', msg: 'HARD STOP. 1 Week Off + Paper Trade' };
-  } else if (activeTier === 2) {
-    riskPercent = 0.5;
-    riskStatus = { level: 2, risk: '0.5%', margin: false, maxPos: 'Max 2', color: 'bg-orange-100 text-orange-800 border-orange-300', msg: 'Level 2 Drawdown' };
-  } else if (activeTier === 1) {
-    riskPercent = 0.75;
-    riskStatus = { level: 1, risk: '0.75%', margin: false, maxPos: 'Normal', color: 'bg-yellow-100 text-yellow-800 border-yellow-300', msg: 'Level 1 Drawdown (No Margin)' };
-  }
+  // --- MATH ENGINE (extracted) ---
+  const riskProfile = computeRiskProfile({
+    peakEquity,
+    currentEquity,
+    manualRiskTier,
+    dailyRealizedPL,
+    qqqStatus,
+    spyStatus,
+    last3R,
+  });
+  const {
+    drawdown,
+    strictTier,
+    activeTier,
+    isRecoveryMode,
+    riskPercent,
+    riskStatus,
+    oneRValue,
+    dailyMaxLossR,
+    dailyMaxLossDollar,
+    isDailyMaxLossBreached,
+    isDrawdown,
+    breakerCActive,
+    breakerBLocked,
+    breakerBWarning,
+  } = riskProfile;
 
-  const oneRValue = currentEquity * (riskPercent / 100);
-  const dailyMaxLossR = 2; 
-  const dailyMaxLossDollar = oneRValue * dailyMaxLossR;
+  const eventRisk = evaluateEventRisk({
+    ticker: tradeTicker,
+    earningsChecked,
+    earningsTiming,
+    eventNotes,
+    highImpactEventPending,
+    highImpactEventApproved,
+  });
 
-  // Max Loss Circuit Breaker Trigger (Realized only)
-  const isDailyMaxLossBreached = dailyRealizedPL <= -dailyMaxLossDollar && dailyMaxLossDollar > 0;
+  const tradePlan = validateTradePlan({
+    setupGrade,
+    originalStop: originalStop || stopPrice,
+    proposedStop: stopPrice,
+    entryPrice,
+    direction: tradeDirection,
+    isAdd,
+    addType,
+    addPrePlanned,
+    positionIsLosing,
+    combinedRiskR,
+    maxCombinedRiskR: 1,
+    unrealizedGainPct,
+    unrealizedR,
+    profitProtectionPlan,
+  });
 
-  const isDrawdown = drawdown >= 5;
-  const breakerCActive = isDrawdown && last3R < 2;
-  const breakerBLocked = qqqStatus === 'below50';
-  const breakerBWarning = qqqStatus === 'below21' || spyStatus === 'below21';
+  const gate = getTradingGate({
+    now: nowTick,
+    schedule: tradingSchedule,
+    risk: riskProfile,
+    eventRisk,
+    tradePlan,
+    setupGrade,
+    routine,
+    requireRoutine: true,
+    workspaceMode,
+    snapshotImportedAt,
+  });
+
+  const portfolioScore = computePortfolioRiskScore({
+    peakEquity,
+    currentEquity,
+    dailyRealizedPL,
+    unrealizedPL,
+    oneRValue,
+    dailyMaxLossDollar,
+    excessLiquidity,
+    buyingPower,
+    maintMargin,
+    positions,
+  });
+
+  // Keep open exposure in true R units (not raw unrealized $)
+  useEffect(() => {
+    setUnrealizedOpenRisk(portfolioScore.openRiskEstimateR);
+  }, [portfolioScore.openRiskEstimateR]);
+
+  const positionSize = computePositionSize({
+    entryPrice,
+    stopPrice,
+    allowedRisk: gate.allowedRisk,
+    direction: tradeDirection,
+    requestedShares: requestedShares > 0 ? requestedShares : undefined,
+  });
+
+  const planOrLiveReady = workspaceMode === 'planning' ? gate.planningReady : gate.allowed;
+  const sizeReady = planOrLiveReady && positionSize.withinLimits;
+  const setupCapBlocked =
+    routine.snapshotImported &&
+    ({ no_trade: 0, C: 1, B: 2, A: 3 }[setupGrade] ?? 0) >
+      ({ no_trade: 0, C: 1, B: 2, A: 3 }[portfolioScore.suggestedSetupCap] ?? 3);
 
   // --- DISCIPLINE ANALYTICS CALCULATIONS ---
   const totalLogs = history.length;
@@ -130,6 +328,114 @@ export default function App() {
 
   // --- ACTIONS ---
   const toggleRoutine = (key) => setRoutine(prev => ({ ...prev, [key]: !prev[key] }));
+
+  const loadTickerIntoPlanner = (item) => {
+    setTradeTicker(item.ticker || '');
+    if (item.setupGrade) setSetupGrade(item.setupGrade);
+    if (item.note) setEventNotes(item.note);
+    setActiveTab('tools');
+  };
+
+  const addToWatchlist = () => {
+    const ticker = (tradeTicker || '').trim().toUpperCase();
+    if (!ticker) return;
+    setWatchlist((prev) => [
+      { id: Date.now(), ticker, note: watchNote || eventNotes || '', setupGrade },
+      ...prev.filter((w) => w.ticker !== ticker),
+    ]);
+    setWatchNote('');
+  };
+
+  const removeFromWatchlist = (id) => {
+    setWatchlist((prev) => prev.filter((w) => w.id !== id));
+  };
+
+  const runOcrOnFile = async (file) => {
+    if (!file) return;
+    setOcrBusy(true);
+    setOcrProgress(0);
+    setOcrError('');
+    try {
+      const worker = await createWorker('eng', 1, {
+        logger: (m) => {
+          if (m.status === 'recognizing text' && m.progress != null) {
+            setOcrProgress(Math.round(m.progress * 100));
+          }
+        },
+      });
+      const ret = await worker.recognize(file);
+      await worker.terminate();
+      const data = ret.data;
+      const parsed = parseIbkrPortfolioText(data.text || '');
+      setOcrDraft({
+        ...parsed,
+        netLiq: parsed.netLiq ?? currentEquity,
+        realizedPL: parsed.realizedPL ?? dailyRealizedPL,
+        unrealizedPL: parsed.unrealizedPL ?? unrealizedPL,
+        excessLiquidity: parsed.excessLiquidity ?? excessLiquidity,
+        buyingPower: parsed.buyingPower ?? buyingPower,
+        maintMargin: parsed.maintMargin ?? maintMargin,
+        positions: parsed.positions.length ? parsed.positions : positions,
+      });
+    } catch (err) {
+      console.error(err);
+      setOcrError('OCR failed. Try a clearer screenshot or enter values manually.');
+      setOcrDraft(emptySnapshot());
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+
+  const applyOcrDraft = () => {
+    if (!ocrDraft) return;
+    const net = Number(ocrDraft.netLiq) || 0;
+    if (net > 0) {
+      setCurrentEquity(net);
+      if (net > peakEquity) setPeakEquity(net);
+    }
+    if (ocrDraft.realizedPL != null) setDailyRealizedPL(Number(ocrDraft.realizedPL) || 0);
+    if (ocrDraft.unrealizedPL != null) setUnrealizedPL(Number(ocrDraft.unrealizedPL) || 0);
+    if (ocrDraft.excessLiquidity != null) setExcessLiquidity(Number(ocrDraft.excessLiquidity) || 0);
+    if (ocrDraft.buyingPower != null) setBuyingPower(Number(ocrDraft.buyingPower) || 0);
+    if (ocrDraft.maintMargin != null) setMaintMargin(Number(ocrDraft.maintMargin) || 0);
+    if (Array.isArray(ocrDraft.positions)) setPositions(ocrDraft.positions);
+
+    const nextScore = computePortfolioRiskScore({
+      peakEquity: Math.max(peakEquity, net),
+      currentEquity: net || currentEquity,
+      dailyRealizedPL: Number(ocrDraft.realizedPL) || 0,
+      unrealizedPL: Number(ocrDraft.unrealizedPL) || 0,
+      oneRValue: (net || currentEquity) * (riskPercent / 100),
+      dailyMaxLossDollar: (net || currentEquity) * (riskPercent / 100) * dailyMaxLossR,
+      excessLiquidity: Number(ocrDraft.excessLiquidity) || 0,
+      buyingPower: Number(ocrDraft.buyingPower) || 0,
+      maintMargin: Number(ocrDraft.maintMargin) || 0,
+      positions: ocrDraft.positions || [],
+    });
+    setUnrealizedOpenRisk(nextScore.openRiskEstimateR);
+
+    const nowIso = new Date().toISOString();
+    setSnapshotImportedAt(nowIso);
+    setRoutine((prev) => ({ ...prev, snapshotImported: true }));
+
+    // Soft-cap setup grade suggestion
+    const cap = nextScore.suggestedSetupCap;
+    const rank = { no_trade: 0, C: 1, B: 2, A: 3 };
+    if ((rank[setupGrade] ?? 0) > (rank[cap] ?? 3)) {
+      setSetupGrade(cap);
+    }
+
+    // Seed watchlist from positions
+    (ocrDraft.positions || []).forEach((p) => {
+      if (!p.ticker) return;
+      setWatchlist((prev) => {
+        if (prev.some((w) => w.ticker === p.ticker)) return prev;
+        return [{ id: Date.now() + Math.random(), ticker: p.ticker, note: `Pos ${p.qty}`, setupGrade: 'no_trade' }, ...prev];
+      });
+    });
+
+    alert('IBKR snapshot applied. Portfolio state + risk score updated.');
+  };
   
   const archiveDay = () => {
     if (!window.confirm("Archive today's data and reset checklists?")) return;
@@ -158,7 +464,16 @@ export default function App() {
       openRisk: unrealizedOpenRisk,
       executionType: executionType,
       mistakeCategory: executionType === 'mistake' ? mistakeCategory : 'none',
-      mistakeCostR: executionType === 'mistake' ? mistakeCostR : 0
+      mistakeCostR: executionType === 'mistake' ? mistakeCostR : 0,
+      gateAllowed: gate.allowed,
+      gateMode: gate.mode,
+      gateReasons: gate.reasons,
+      ticker: tradeTicker,
+      setupGrade,
+      earningsTiming,
+      earningsChecked,
+      allowedRisk: gate.allowedRisk,
+      calculatedShares: positionSize.shares,
     };
     
     saveHistory([newEntry, ...history]);
@@ -172,7 +487,17 @@ export default function App() {
     setMistakeCostR(0);
     setFiveWs({ w1: '', w2: '', w3: '', w4: '', w5: '', solution: '' });
     setJournalDate(new Date().toISOString().split('T')[0]); // Reset date picker to current local date
-    setRoutine({ journal: false, alerts: false, orders: false, handsOff: false, reviewPos: false, moveStops: false });
+    setRoutine({
+      snapshotImported: false,
+      journal: false,
+      alerts: false,
+      orders: false,
+      handsOff: false,
+      reviewPos: false,
+      moveStops: false,
+    });
+    setSnapshotImportedAt(null);
+    setOcrDraft(null);
     alert("Day archived successfully! Focus on the next small win.");
   };
 
@@ -193,7 +518,49 @@ export default function App() {
   };
 
   const exportDatabase = () => {
-    const backupData = { history, peakEquity, currentEquity, last3R, manualRiskTier, qqqStatus, spyStatus };
+    const backupData = {
+      history,
+      peakEquity,
+      currentEquity,
+      last3R,
+      manualRiskTier,
+      qqqStatus,
+      spyStatus,
+      tradeGateConfig: {
+        tradingSchedule,
+        tradeTicker,
+        earningsChecked,
+        earningsTiming,
+        eventNotes,
+        highImpactEventPending,
+        highImpactEventApproved,
+        setupGrade,
+        entryPrice,
+        stopPrice,
+        originalStop,
+        tradeDirection,
+        isAdd,
+        addType,
+        addPrePlanned,
+        positionIsLosing,
+        combinedRiskR,
+        unrealizedGainPct,
+        unrealizedR,
+        profitProtectionPlan,
+        requestedShares,
+        workspaceMode,
+        watchlist,
+        unrealizedPL,
+        excessLiquidity,
+        buyingPower,
+        maintMargin,
+        positions,
+        snapshotImportedAt,
+        routine,
+        unrealizedOpenRisk,
+        dailyRealizedPL,
+      },
+    };
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData));
     const downloadAnchor = document.createElement('a');
     downloadAnchor.setAttribute("href", dataStr);
@@ -201,6 +568,40 @@ export default function App() {
     document.body.appendChild(downloadAnchor);
     downloadAnchor.click();
     downloadAnchor.remove();
+  };
+
+  const applyTradeGateConfig = (g) => {
+    if (!g) return;
+    if (g.tradingSchedule) setTradingSchedule(g.tradingSchedule);
+    if (g.tradeTicker != null) setTradeTicker(g.tradeTicker);
+    if (g.earningsChecked != null) setEarningsChecked(g.earningsChecked);
+    if (g.earningsTiming) setEarningsTiming(g.earningsTiming);
+    if (g.eventNotes != null) setEventNotes(g.eventNotes);
+    if (g.highImpactEventPending != null) setHighImpactEventPending(g.highImpactEventPending);
+    if (g.highImpactEventApproved != null) setHighImpactEventApproved(g.highImpactEventApproved);
+    if (g.setupGrade) setSetupGrade(g.setupGrade);
+    if (g.entryPrice != null) setEntryPrice(Number(g.entryPrice));
+    if (g.stopPrice != null) setStopPrice(Number(g.stopPrice));
+    if (g.originalStop != null) setOriginalStop(Number(g.originalStop));
+    if (g.tradeDirection) setTradeDirection(g.tradeDirection);
+    if (g.isAdd != null) setIsAdd(g.isAdd);
+    if (g.addType) setAddType(g.addType);
+    if (g.addPrePlanned != null) setAddPrePlanned(g.addPrePlanned);
+    if (g.positionIsLosing != null) setPositionIsLosing(g.positionIsLosing);
+    if (g.combinedRiskR != null) setCombinedRiskR(Number(g.combinedRiskR));
+    if (g.unrealizedGainPct != null) setUnrealizedGainPct(Number(g.unrealizedGainPct));
+    if (g.unrealizedR != null) setUnrealizedR(Number(g.unrealizedR));
+    if (g.profitProtectionPlan) setProfitProtectionPlan(g.profitProtectionPlan);
+    if (g.requestedShares != null) setRequestedShares(Number(g.requestedShares));
+    if (g.workspaceMode) setWorkspaceMode(g.workspaceMode);
+    if (Array.isArray(g.watchlist)) setWatchlist(g.watchlist);
+    if (g.unrealizedPL != null) setUnrealizedPL(Number(g.unrealizedPL));
+    if (g.excessLiquidity != null) setExcessLiquidity(Number(g.excessLiquidity));
+    if (g.buyingPower != null) setBuyingPower(Number(g.buyingPower));
+    if (g.maintMargin != null) setMaintMargin(Number(g.maintMargin));
+    if (Array.isArray(g.positions)) setPositions(g.positions);
+    if (g.snapshotImportedAt) setSnapshotImportedAt(g.snapshotImportedAt);
+    if (g.routine) setRoutine((prev) => ({ ...prev, ...g.routine }));
   };
 
   const importDatabase = (e) => {
@@ -216,6 +617,7 @@ export default function App() {
         if (parsed.manualRiskTier) setManualRiskTier(parsed.manualRiskTier);
         if (parsed.qqqStatus) setQqqStatus(parsed.qqqStatus);
         if (parsed.spyStatus) setSpyStatus(parsed.spyStatus);
+        if (parsed.tradeGateConfig) applyTradeGateConfig(parsed.tradeGateConfig);
         alert("Database successfully restored from file!");
       } catch (err) {
         alert("Failed to parse database file. Make sure it is a valid backup JSON.");
@@ -249,7 +651,7 @@ export default function App() {
                 <Activity className="text-blue-400" />
                 Peleg Trading Engine OS
               </h1>
-              <p className="text-slate-400 text-sm mt-1">Swing Trading Foundation • IDT Timezone</p>
+              <p className="text-slate-400 text-sm mt-1">State · Plan & Size · Journal • IDT</p>
             </div>
             <div className="text-left md:text-right bg-slate-800 p-3 rounded-lg border border-slate-700">
               <div className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Current Net Liq</div>
@@ -259,24 +661,32 @@ export default function App() {
           
           <div className="flex gap-1 overflow-x-auto no-scrollbar">
             <button 
-              onClick={() => setActiveTab('dashboard')}
-              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors whitespace-nowrap ${activeTab === 'dashboard' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+              onClick={() => setActiveTab('state')}
+              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'state' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
-              Dashboard & Execution
+              <Activity className="h-4 w-4" />
+              Portfolio & Market
+            </button>
+            <button 
+              onClick={() => setActiveTab('tools')}
+              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'tools' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+            >
+              <Calculator className="h-4 w-4" />
+              Plan & Size
             </button>
             <button 
               onClick={() => setActiveTab('archive')}
               className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'archive' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
               <Calendar className="h-4 w-4" />
-              Journal Archive ({history.length})
+              Journal ({history.length})
             </button>
             <button 
               onClick={() => setActiveTab('blueprint')}
               className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'blueprint' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
               <FileText className="h-4 w-4" />
-              Engine Blueprint
+              Blueprint
             </button>
           </div>
         </div>
@@ -284,8 +694,203 @@ export default function App() {
 
       <div className="max-w-6xl mx-auto p-4 md:p-8">
         
-        {/* --- TAB 1: DASHBOARD --- */}
-        {activeTab === 'dashboard' && (
+        {/* --- TAB 1: PORTFOLIO & MARKET STATE --- */}
+        {activeTab === 'state' && (
+          <div className="space-y-4">
+            <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-700 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1">
+                  Portfolio & Market State <HelpIcon fieldId="snapshotImport" />
+                </div>
+                <p className="text-sm text-slate-300 mt-1">Start of day: import IBKR Portfolio screenshot, then review risk score.</p>
+              </div>
+              <button
+                onClick={() => setActiveTab('tools')}
+                className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-lg flex items-center gap-2"
+              >
+                <Calculator className="h-4 w-4" />
+                Open Plan & Size
+              </button>
+            </div>
+
+            {/* IBKR OCR IMPORT */}
+            <div className="bg-white p-5 rounded-xl shadow-sm border border-indigo-200">
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <h2 className="text-base font-bold flex items-center gap-2 text-indigo-900">
+                    <Upload className="h-5 w-5" />
+                    Start of day: Import IBKR Portfolio
+                    <HelpIcon fieldId="snapshotImport" />
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-1">OCR via Tesseract — always review before Apply.</p>
+                </div>
+                {routine.snapshotImported && (
+                  <span className="text-[10px] font-bold uppercase bg-emerald-100 text-emerald-800 px-2 py-1 rounded border border-emerald-200">
+                    Imported {snapshotImportedAt ? new Date(snapshotImportedAt).toLocaleString() : ''}
+                  </span>
+                )}
+              </div>
+              <label className="flex flex-col items-center justify-center border-2 border-dashed border-indigo-200 rounded-lg p-6 cursor-pointer hover:bg-indigo-50/50">
+                <span className="text-sm font-semibold text-indigo-800">Drop or click to upload screenshot</span>
+                <span className="text-[11px] text-slate-500 mt-1">IBKR mobile Portfolio tab</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => runOcrOnFile(e.target.files?.[0])}
+                />
+              </label>
+              {ocrBusy && (
+                <div className="mt-3 text-xs font-mono text-indigo-700">OCR progress: {ocrProgress}%</div>
+              )}
+              {ocrError && <div className="mt-2 text-xs text-red-700 font-semibold">{ocrError}</div>}
+
+              {ocrDraft && (
+                <div className="mt-4 border-t border-slate-100 pt-4 space-y-3">
+                  <div className="flex items-center gap-1 text-xs font-bold text-slate-600 uppercase">
+                    Review OCR fields <HelpIcon fieldId="ocrReview" />
+                  </div>
+                  {ocrDraft.parseNotes?.length > 0 && (
+                    <ul className="text-[11px] text-amber-800 bg-amber-50 border border-amber-100 rounded p-2 space-y-0.5">
+                      {ocrDraft.parseNotes.map((n) => <li key={n}>• {n}</li>)}
+                    </ul>
+                  )}
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                    {[
+                      ['netLiq', 'Net Liq', 'currentEquity'],
+                      ['realizedPL', 'Realized P&L', 'dailyRealizedPL'],
+                      ['unrealizedPL', 'Unrealized P&L', 'unrealizedPL'],
+                      ['excessLiquidity', 'Excess Liq', 'excessLiquidity'],
+                      ['buyingPower', 'Buying Power', 'buyingPower'],
+                      ['maintMargin', 'Maint Margin', 'maintMargin'],
+                    ].map(([key, label, helpId]) => (
+                      <div key={key}>
+                        <FieldHelp fieldId={helpId} label={label} labelClassName="text-[10px] font-bold text-slate-400 uppercase" />
+                        <input
+                          type="number"
+                          value={ocrDraft[key] ?? ''}
+                          onChange={(e) => setOcrDraft({ ...ocrDraft, [key]: Number(e.target.value) })}
+                          className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <div>
+                    <FieldHelp fieldId="positions" label="Positions" labelClassName="text-[10px] font-bold text-slate-400 uppercase" />
+                    <div className="mt-2 hidden md:grid md:grid-cols-6 gap-1 text-[9px] font-bold text-slate-400 uppercase px-0.5">
+                      <span className="flex items-center gap-0.5">Ticker <HelpIcon fieldId="posTicker" /></span>
+                      <span className="flex items-center gap-0.5">Qty <HelpIcon fieldId="posQty" /></span>
+                      <span className="flex items-center gap-0.5">Last <HelpIcon fieldId="posLast" /></span>
+                      <span className="flex items-center gap-0.5">P&L <HelpIcon fieldId="posPnl" /></span>
+                      <span className="flex items-center gap-0.5">Entry $ <HelpIcon fieldId="posEntryPrice" /></span>
+                      <span className="flex items-center gap-0.5">Entry date <HelpIcon fieldId="posEntryDate" /></span>
+                    </div>
+                    <div className="mt-1 space-y-2">
+                      {(ocrDraft.positions || []).map((p, idx) => (
+                        <div key={`${p.ticker || 'row'}-${idx}`} className="grid grid-cols-2 md:grid-cols-6 gap-1 text-xs bg-slate-50 border border-slate-100 rounded p-1.5">
+                          <div>
+                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Ticker <HelpIcon fieldId="posTicker" /></span>
+                            <input className="w-full border rounded p-1 font-mono" value={p.ticker} onChange={(e) => {
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = { ...p, ticker: e.target.value.toUpperCase() };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} placeholder="TICKER" />
+                          </div>
+                          <div>
+                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Qty <HelpIcon fieldId="posQty" /></span>
+                            <input type="number" className="w-full border rounded p-1 font-mono" value={p.qty || ''} onChange={(e) => {
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = { ...p, qty: Number(e.target.value) };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} placeholder="qty" />
+                          </div>
+                          <div>
+                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Last <HelpIcon fieldId="posLast" /></span>
+                            <input type="number" step="0.01" className="w-full border rounded p-1 font-mono" value={p.last ?? ''} onChange={(e) => {
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = { ...p, last: Number(e.target.value) };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} placeholder="last" />
+                          </div>
+                          <div>
+                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">P&L <HelpIcon fieldId="posPnl" /></span>
+                            <input type="number" className="w-full border rounded p-1 font-mono" value={p.pnl ?? ''} onChange={(e) => {
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = { ...p, pnl: Number(e.target.value) };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} placeholder="pnl" />
+                          </div>
+                          <div>
+                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Entry $ <HelpIcon fieldId="posEntryPrice" /></span>
+                            <input type="number" step="0.01" className="w-full border rounded p-1 font-mono" value={p.entryPrice ?? ''} onChange={(e) => {
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = { ...p, entryPrice: Number(e.target.value) };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} placeholder="avg entry" />
+                          </div>
+                          <div>
+                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Entry date <HelpIcon fieldId="posEntryDate" /></span>
+                            <input type="date" className="w-full border rounded p-1 font-mono" value={p.entryDate || ''} onChange={(e) => {
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = { ...p, entryDate: e.target.value };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} />
+                          </div>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="text-[11px] text-indigo-700 font-semibold"
+                        onClick={() => setOcrDraft({
+                          ...ocrDraft,
+                          positions: [...(ocrDraft.positions || []), { ticker: '', qty: 0, entryPrice: undefined, entryDate: '' }],
+                        })}
+                      >
+                        + Add position row
+                      </button>
+                    </div>
+                  </div>
+                  {ocrDraft.rawText && (
+                    <details className="text-xs">
+                      <summary className="cursor-pointer text-slate-500 font-semibold flex items-center gap-1">
+                        Raw OCR text <HelpIcon fieldId="ocrRawText" />
+                      </summary>
+                      <pre className="mt-2 max-h-40 overflow-auto bg-slate-900 text-slate-200 p-2 rounded text-[10px] whitespace-pre-wrap">
+                        {ocrDraft.rawText}
+                      </pre>
+                    </details>
+                  )}
+                  <button
+                    onClick={applyOcrDraft}
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2.5 rounded-lg text-sm"
+                  >
+                    Apply to Portfolio State
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* RISK SCORE */}
+            <div className={`p-5 rounded-xl border shadow-sm ${
+              portfolioScore.grade === 'green' ? 'bg-emerald-50 border-emerald-200' :
+              portfolioScore.grade === 'yellow' ? 'bg-amber-50 border-amber-200' : 'bg-red-50 border-red-200'
+            }`}>
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-base font-bold flex items-center gap-2">
+                  Portfolio Risk Score <HelpIcon fieldId="portfolioRiskScore" />
+                </h2>
+                <div className="text-3xl font-black font-mono">{portfolioScore.score}</div>
+              </div>
+              <div className="text-xs font-bold uppercase tracking-wider mb-2">
+                Grade {portfolioScore.grade} · Setup cap: {portfolioScore.suggestedSetupCap}
+              </div>
+              <ul className="space-y-1">
+                {portfolioScore.reasons.map((r) => (
+                  <li key={r} className="text-xs text-slate-700">• {r}</li>
+                ))}
+              </ul>
+            </div>
+
           <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
             
             {/* COLUMN 1: Math & Limits (Left - 4 cols) */}
@@ -298,16 +903,16 @@ export default function App() {
                 </h2>
                 <div className="space-y-4">
                   <div>
-                    <label className="block text-xs font-bold text-slate-500 uppercase">High-Water Mark (Peak)</label>
+                    <FieldHelp fieldId="peakEquity" label="High-Water Mark (Peak)" />
                     <input type="number" value={peakEquity} onChange={(e) => setPeakEquity(Number(e.target.value))} className="mt-1 w-full p-2 border border-slate-300 rounded-md font-mono focus:ring-blue-500 bg-slate-50" />
                   </div>
                   <div>
-                    <label className="block text-xs font-bold text-slate-500 uppercase">Current Net Liq</label>
+                    <FieldHelp fieldId="currentEquity" label="Current Net Liq" />
                     <input type="number" value={currentEquity} onChange={(e) => setCurrentEquity(Number(e.target.value))} className="mt-1 w-full p-2 border border-slate-300 rounded-md font-mono focus:ring-blue-500 bg-slate-50" />
                   </div>
                   
                   <div className={`p-3 rounded-lg border flex justify-between items-center ${drawdown >= 15 ? 'bg-red-50 border-red-200 text-red-700' : drawdown > 0 ? 'bg-orange-50 border-orange-200 text-orange-700' : 'bg-green-50 border-green-200 text-green-700'}`}>
-                    <span className="font-semibold text-sm">Drawdown:</span>
+                    <span className="font-semibold text-sm flex items-center gap-1">Drawdown <HelpIcon fieldId="drawdown" /></span>
                     <span className="font-mono font-bold text-lg">{drawdown.toFixed(2)}%</span>
                   </div>
                 </div>
@@ -319,7 +924,7 @@ export default function App() {
                     Recovery Override
                   </div>
                 )}
-                <h2 className="text-xs font-bold uppercase tracking-wider mb-1 opacity-80">Allowed Risk Per Trade</h2>
+                <h2 className="text-xs font-bold uppercase tracking-wider mb-1 opacity-80 flex items-center gap-1">Allowed Risk Per Trade <HelpIcon fieldId="oneR" /></h2>
                 <div className="text-3xl font-black mb-1">{riskStatus.risk}</div>
                 {riskStatus.msg && <div className="font-bold text-xs mb-3">{riskStatus.msg}</div>}
               </div>
@@ -328,14 +933,14 @@ export default function App() {
                 <h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Risk Parameters</h2>
                 <div className="space-y-3">
                   <div className="flex justify-between items-center border-b border-slate-700 pb-2">
-                    <span className="text-sm font-medium">1R Base Value:</span>
+                    <span className="text-sm font-medium flex items-center gap-1">1R Base Value <HelpIcon fieldId="oneR" /></span>
                     <span className="font-mono font-bold text-blue-400">
                       ${riskPercent > 0 ? oneRValue.toLocaleString(undefined, {maximumFractionDigits: 0}) : '0'}
                     </span>
                   </div>
                   <div className="flex justify-between items-center border-b border-slate-700 pb-2">
-                    <span className="text-sm font-medium flex items-center gap-1 text-red-400" title="Only applies to realized, closed positions intraday">
-                      <AlertCircle className="h-4 w-4" /> Realized Max Daily Loss:
+                    <span className="text-sm font-medium flex items-center gap-1 text-red-400">
+                      <AlertCircle className="h-4 w-4" /> Max Daily Loss <HelpIcon fieldId="dailyMaxLoss" />
                     </span>
                     <div className="text-right">
                       <div className="font-mono font-bold text-red-400">-{dailyMaxLossR}R</div>
@@ -345,15 +950,80 @@ export default function App() {
                     </div>
                   </div>
                   <div>
-                    <label className="block text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-1">Today's Realized Session P&L ($)</label>
+                    <FieldHelp fieldId="dailyRealizedPL" label="Today's Realized Session P&L ($)" labelClassName="text-[10px] text-slate-400 uppercase tracking-wider font-semibold" />
                     <input 
                       type="number" 
                       value={dailyRealizedPL} 
                       onChange={(e) => setDailyRealizedPL(Number(e.target.value))} 
                       placeholder="e.g. -1200"
-                      className="w-full p-2 border border-slate-700 bg-slate-900 rounded-md text-sm font-mono text-white focus:ring-blue-500" 
+                      className="mt-1 w-full p-2 border border-slate-700 bg-slate-900 rounded-md text-sm font-mono text-white focus:ring-blue-500" 
                     />
                   </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <FieldHelp fieldId="unrealizedPL" label="Unrealized P&L" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
+                      <input type="number" value={unrealizedPL} onChange={(e) => setUnrealizedPL(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="excessLiquidity" label="Excess Liq" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
+                      <input type="number" value={excessLiquidity} onChange={(e) => setExcessLiquidity(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="buyingPower" label="Buying Power" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
+                      <input type="number" value={buyingPower} onChange={(e) => setBuyingPower(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="maintMargin" label="Maint Margin" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
+                      <input type="number" value={maintMargin} onChange={(e) => setMaintMargin(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                    </div>
+                  </div>
+                  {positions.length > 0 && (
+                    <div>
+                      <FieldHelp fieldId="positions" label="Open Positions" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
+                      <ul className="mt-1 space-y-2 max-h-40 overflow-y-auto overflow-x-hidden thin-scrollbar pr-0.5">
+                        {positions.map((p) => (
+                          <li key={p.ticker} className="text-[11px] font-mono text-slate-300 border border-slate-700 rounded p-1.5 space-y-1 min-w-0">
+                            <div className="flex justify-between gap-2">
+                              <span className="truncate">{p.ticker} × {p.qty}</span>
+                              <span className="shrink-0">{p.pnl != null ? p.pnl.toLocaleString() : '—'}</span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-1 min-w-0">
+                              <div className="min-w-0">
+                                <span className="text-[9px] text-slate-500 uppercase flex items-center gap-0.5">Entry $ <HelpIcon fieldId="posEntryPrice" /></span>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={p.entryPrice ?? ''}
+                                  onChange={(e) => {
+                                    const next = positions.map((row) =>
+                                      row.ticker === p.ticker ? { ...row, entryPrice: Number(e.target.value) } : row
+                                    );
+                                    setPositions(next);
+                                  }}
+                                  className="w-full min-w-0 p-1 border border-slate-700 bg-slate-900 rounded text-[10px] font-mono text-white"
+                                  placeholder="avg"
+                                />
+                              </div>
+                              <div className="min-w-0">
+                                <span className="text-[9px] text-slate-500 uppercase flex items-center gap-0.5">Entry date <HelpIcon fieldId="posEntryDate" /></span>
+                                <input
+                                  type="date"
+                                  value={p.entryDate || ''}
+                                  onChange={(e) => {
+                                    const next = positions.map((row) =>
+                                      row.ticker === p.ticker ? { ...row, entryDate: e.target.value } : row
+                                    );
+                                    setPositions(next);
+                                  }}
+                                  className="w-full min-w-0 p-1 border border-slate-700 bg-slate-900 rounded text-[10px] font-mono text-white"
+                                />
+                              </div>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                   {isDailyMaxLossBreached && (
                     <div className="p-2 bg-red-900 border border-red-700 rounded text-xs font-bold text-red-100 flex items-center gap-1">
                       <Ban className="h-4 w-4 shrink-0" />
@@ -363,32 +1033,75 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="bg-white p-4 rounded-xl border border-slate-200">
+                <div className="text-[10px] uppercase font-bold text-slate-400 mb-1">Session clock</div>
+                <div className="flex justify-between text-sm font-mono font-bold">
+                  <span>IDT {gate.israelTimeLabel}</span>
+                  <span>ET {gate.etTimeLabel}</span>
+                </div>
+                <div className="text-xs text-slate-500 mt-1">Phase: {gate.phase} · Window: {gate.activeWindowLabel || 'none'}</div>
+                <div className="mt-2 space-y-1.5 text-xs text-slate-600">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1">Unrealized P&L <HelpIcon fieldId="unrealizedPL" /></span>
+                    <span className={`font-mono font-bold ${unrealizedPL < 0 ? 'text-red-600' : unrealizedPL > 0 ? 'text-emerald-600' : ''}`}>
+                      {unrealizedPL < 0 ? '-' : ''}${Math.abs(unrealizedPL).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1">Open exposure <HelpIcon fieldId="unrealizedOpenRisk" /></span>
+                    <span className="font-mono font-bold">
+                      {oneRValue > 0 ? `${unrealizedOpenRisk}R` : '— (1R is $0)'}
+                    </span>
+                  </div>
+                </div>
+                {oneRValue > 0 && (
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={unrealizedOpenRisk}
+                    onChange={(e) => setUnrealizedOpenRisk(Number(e.target.value))}
+                    className="mt-2 w-full p-1.5 border rounded text-xs font-mono bg-slate-50"
+                    placeholder="Open exposure (R)"
+                  />
+                )}
+              </div>
+
             </div>
 
             {/* COLUMN 2: Rules & Breakers (Middle - 4 cols) */}
             <div className="md:col-span-4 space-y-6">
-              
+
               <div className="bg-orange-50 p-5 rounded-xl shadow-sm border border-orange-200">
                 <h2 className="text-base font-bold mb-3 flex items-center gap-2 text-orange-800">
                   <ShieldAlert className="h-5 w-5" />
                   Rules of Engagement
                 </h2>
-                <div className="text-xs text-orange-700 font-semibold mb-3 uppercase tracking-wider">Active: 4:30 PM - 11:00 PM IDT</div>
+                <div className="text-xs text-orange-700 font-semibold mb-3 uppercase tracking-wider">
+                  Approved windows: 17:00–18:00 · 20:30–22:45 IDT · Regular hours only
+                </div>
                 <ul className="space-y-3">
                   <li className="flex gap-2 text-sm text-slate-800 font-medium">
                     <span className="text-orange-500 font-bold">1.</span> 
-                    No discretionary intraday trades. Use pre-set bracket orders only.
+                    No premarket / after-hours new trades. Planned day trades in approved windows only.
                   </li>
                   <li className="flex gap-2 text-sm text-slate-800 font-medium">
                     <span className="text-orange-500 font-bold">2.</span> 
-                    A physical stop-loss order can NEVER be adjusted downward.
+                    Earnings checked before entry. Today / tomorrow / unknown = blocked.
                   </li>
                   <li className="flex gap-2 text-sm text-slate-800 font-medium">
                     <span className="text-orange-500 font-bold">3.</span> 
-                    If a trade stalls near SL for 2 days on heavy volume -{'>'} Action Stop.
+                    A physical stop-loss order can NEVER be adjusted downward / wider.
                   </li>
                   <li className="flex gap-2 text-sm text-slate-800 font-medium">
                     <span className="text-orange-500 font-bold">4.</span> 
+                    No add-to-losers unless pre-planned. Size from calculator only.
+                  </li>
+                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
+                    <span className="text-orange-500 font-bold">5.</span> 
+                    At +15% or +2R protect profits. After +20% do not let winners become losers.
+                  </li>
+                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
+                    <span className="text-orange-500 font-bold">6.</span> 
                     Respect the daily -{dailyMaxLossR}R loss limit. Stop trading if hit.
                   </li>
                 </ul>
@@ -428,16 +1141,16 @@ export default function App() {
                   <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Breaker B: Market Regime</h3>
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div>
-                      <label className="text-[10px] text-slate-400 uppercase font-bold">QQQ</label>
-                      <select value={qqqStatus} onChange={(e) => setQqqStatus(e.target.value)} className="w-full p-1.5 text-sm border rounded focus:ring-indigo-500 bg-slate-50">
+                      <FieldHelp fieldId="qqqStatus" label="QQQ" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <select value={qqqStatus} onChange={(e) => setQqqStatus(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded focus:ring-indigo-500 bg-slate-50">
                         <option value="above21">Above 21 EMA</option>
                         <option value="below21">Below 21 EMA</option>
                         <option value="below50">Below 50 SMA</option>
                       </select>
                     </div>
                     <div>
-                      <label className="text-[10px] text-slate-400 uppercase font-bold">SPY</label>
-                      <select value={spyStatus} onChange={(e) => setSpyStatus(e.target.value)} className="w-full p-1.5 text-sm border rounded focus:ring-indigo-500 bg-slate-50">
+                      <FieldHelp fieldId="spyStatus" label="SPY" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <select value={spyStatus} onChange={(e) => setSpyStatus(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded focus:ring-indigo-500 bg-slate-50">
                         <option value="above21">Above 21 EMA</option>
                         <option value="below21">Below 21 EMA</option>
                         <option value="below50">Below 50 SMA</option>
@@ -458,7 +1171,7 @@ export default function App() {
                   <div className="flex flex-col gap-3">
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-[11px] text-slate-500 font-medium flex flex-col">
-                        <span>Closed R-Multiple:</span>
+                        <span className="flex items-center gap-1">Closed R-Multiple <HelpIcon fieldId="last3R" /></span>
                         <span className="text-[9px] text-amber-600 font-semibold">(Realized only)</span>
                       </div>
                       <input 
@@ -486,11 +1199,11 @@ export default function App() {
                     
                     {isDrawdown && (
                       <div className="pt-2 border-t border-indigo-100">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Active Risk Tier Override</label>
+                        <FieldHelp fieldId="manualRiskTier" label="Active Risk Tier Override" labelClassName="text-[10px] font-bold text-slate-500 uppercase" />
                         <select 
                           value={manualRiskTier} 
                           onChange={(e) => setManualRiskTier(e.target.value)}
-                          className={`w-full p-1.5 text-sm border rounded font-medium ${breakerCActive && manualRiskTier !== 'auto' ? 'border-red-300 bg-red-50 text-red-700' : 'bg-white focus:ring-indigo-500'}`}
+                          className={`mt-1 w-full p-1.5 text-sm border rounded font-medium ${breakerCActive && manualRiskTier !== 'auto' ? 'border-red-300 bg-red-50 text-red-700' : 'bg-white focus:ring-indigo-500'}`}
                         >
                           <option value="auto">Auto (Math: Lvl {strictTier})</option>
                           <option value="2">Force Lvl 2 (0.5% - Max 2 Pos)</option>
@@ -516,164 +1229,438 @@ export default function App() {
 
             </div>
 
-            {/* COLUMN 3: Routine & Archiving (Right - 4 cols) */}
+            {/* COLUMN 3: State summary */}
             <div className="md:col-span-4 space-y-6">
-              
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 flex flex-col h-full">
-                <h2 className="text-base font-bold mb-4 flex items-center gap-2 text-slate-800">
-                  <CheckCircle className="text-emerald-500 h-5 w-5" />
-                  Daily Routine & Notes
-                </h2>
-
-                <div className="space-y-4 flex-grow">
-                  {/* Morning */}
-                  <div className="border-b border-slate-100 pb-3">
-                    <h3 className="text-xs font-bold text-blue-600 uppercase tracking-wider mb-2">5:00 AM - Deep Work</h3>
-                    <label className="flex items-center gap-2 cursor-pointer mb-2">
-                      <div onClick={() => toggleRoutine('journal')} className="text-blue-500">{routine.journal ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                      <span className={`text-sm ${routine.journal ? 'line-through text-slate-400' : 'text-slate-700'}`}>10-Min Tradervue Tagging</span>
-                    </label>
-                    <label className="flex items-center gap-2 cursor-pointer mb-2">
-                      <div onClick={() => toggleRoutine('alerts')} className="text-blue-500">{routine.alerts ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                      <span className={`text-sm ${routine.alerts ? 'line-through text-slate-400' : 'text-slate-700'}`}>Set TradingView Alerts</span>
-                    </label>
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <div onClick={() => toggleRoutine('orders')} className="text-blue-500">{routine.orders ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                      <span className={`text-sm ${routine.orders ? 'line-through text-slate-400' : 'text-slate-700'}`}>Enter Broker Bracket Orders</span>
-                    </label>
-                  </div>
-
-                  {/* Market Hours */}
-                  <div className="border-b border-slate-100 pb-3">
-                    <h3 className="text-xs font-bold text-orange-600 uppercase tracking-wider mb-2">4:30 PM - Market Open</h3>
-                    <label className="flex items-center gap-2 cursor-pointer mb-2">
-                      <div onClick={() => toggleRoutine('handsOff')} className="text-orange-500">{routine.handsOff ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                      <span className={`text-sm ${routine.handsOff ? 'line-through text-slate-400' : 'text-slate-700'}`}>Hands-off rule maintained</span>
-                    </label>
-                    <div>
-                      <label className="block text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-1" title="Visual check only. Does not impact realized daily max loss">Open Position Exposure (Floating R)</label>
-                      <input 
-                        type="number" 
-                        step="0.1"
-                        value={unrealizedOpenRisk} 
-                        onChange={(e) => setUnrealizedOpenRisk(Number(e.target.value))} 
-                        placeholder="e.g. -2.5"
-                        className="w-full p-1.5 border border-slate-300 bg-slate-50 rounded text-xs font-mono focus:ring-blue-500" 
-                      />
-                    </div>
-                  </div>
-
-                  {/* After Hours */}
-                  <div className="border-b border-slate-100 pb-3">
-                    <h3 className="text-xs font-bold text-indigo-600 uppercase tracking-wider mb-2">11:00 PM - Post Close</h3>
-                    <label className="flex items-center gap-2 cursor-pointer mb-2">
-                      <div onClick={() => toggleRoutine('reviewPos')} className="text-indigo-500">{routine.reviewPos ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                      <span className={`text-sm ${routine.reviewPos ? 'line-through text-slate-400' : 'text-slate-700'}`}>Review open positions logic</span>
-                    </label>
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <div onClick={() => toggleRoutine('moveStops')} className="text-indigo-500">{routine.moveStops ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                      <span className={`text-sm ${routine.moveStops ? 'line-through text-slate-400' : 'text-slate-700'}`}>Trail stops mathematically (10/20 SMA)</span>
-                    </label>
-                  </div>
-                  
-                  {/* Daily Notes Field & 5W Mistake Register */}
-                  <div className="pt-2">
-                    <div className="grid grid-cols-2 gap-2 mb-3">
-                      <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Entry Date</label>
-                        <input 
-                          type="date" 
-                          value={journalDate}
-                          onChange={(e) => setJournalDate(e.target.value)}
-                          className="w-full p-1.5 text-xs border border-slate-300 rounded focus:ring-emerald-500 bg-slate-50 font-mono"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Execution Quality</label>
-                        <select 
-                          value={executionType} 
-                          onChange={(e) => setExecutionType(e.target.value)}
-                          className="w-full p-1.5 text-xs border border-slate-300 rounded focus:ring-emerald-500 bg-slate-50 font-medium"
-                        >
-                          <option value="perfect">Perfect Plan Followed</option>
-                          <option value="mistake">Execution Mistake Made</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    {executionType === 'mistake' && (
-                      <div className="bg-red-50 p-3 rounded border border-red-200 mb-3 space-y-3">
-                        <div className="flex gap-2">
-                          <div className="w-2/3">
-                            <label className="text-[10px] font-bold text-red-700 uppercase block">Mistake Classification</label>
-                            <select 
-                              value={mistakeCategory} 
-                              onChange={(e) => setMistakeType(e.target.value)}
-                              className="w-full mt-1 p-1 text-[11px] border border-red-300 rounded bg-white font-medium text-red-800"
-                            >
-                              <option value="none">Choose classification...</option>
-                              <option value="fomo">FOMO / Impulsive Entry</option>
-                              <option value="chasing">Chasing Stock Past Breakout</option>
-                              <option value="stop_down">Moved Stop Loss Downward</option>
-                              <option value="oversized">Violated Allowed Sizing Tier</option>
-                              <option value="early_exit">Choked Off Runner (Early Exit)</option>
-                            </select>
-                          </div>
-                          <div className="w-1/3">
-                            <label className="text-[10px] font-bold text-red-700 uppercase block">Cost (R)</label>
-                            <input 
-                              type="number" 
-                              step="0.5"
-                              placeholder="e.g. 1.5"
-                              value={mistakeCostR} 
-                              onChange={(e) => setMistakeCostR(Number(e.target.value))}
-                              className="w-full mt-1 p-1 text-[11px] border border-red-300 rounded bg-white text-right font-mono"
-                            />
-                          </div>
-                        </div>
-
-                        {/* SMB Capital 5 W's Framework */}
-                        <div className="border-t border-red-200 pt-2">
-                          <label className="text-[10px] font-bold text-red-800 uppercase flex items-center gap-1 mb-2">
-                            <HelpCircle className="w-3 h-3" /> SMB 5 W's Diagnosis Model
-                          </label>
-                          <div className="space-y-1">
-                            <input type="text" placeholder="1. Why did I do it?" value={fiveWs.w1} onChange={e => setFiveWs({...fiveWs, w1: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded animate-pulse" />
-                            <input type="text" placeholder="2. Why is that?" value={fiveWs.w2} onChange={e => setFiveWs({...fiveWs, w2: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded" />
-                            <input type="text" placeholder="3. Why is THAT?" value={fiveWs.w3} onChange={e => setFiveWs({...fiveWs, w3: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded" />
-                            <input type="text" placeholder="4. Why?" value={fiveWs.w4} onChange={e => setFiveWs({...fiveWs, w4: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded" />
-                            <input type="text" placeholder="5. Ultimate Root Cause?" value={fiveWs.w5} onChange={e => setFiveWs({...fiveWs, w5: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded bg-red-100 font-medium" />
-                            <input type="text" placeholder="Actionable Solution for Next Time" value={fiveWs.solution} onChange={e => setFiveWs({...fiveWs, solution: e.target.value})} className="w-full p-1.5 mt-2 text-[10px] border border-emerald-300 bg-emerald-50 rounded text-emerald-900 font-bold" />
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                     
-                     <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Daily Journal Notes</label>
-                     <textarea 
-                        className="w-full h-20 p-2 text-xs border border-slate-300 rounded focus:ring-emerald-500 bg-slate-50" 
-                        placeholder="What did I do well? Market climate? Setup thoughts?"
-                        value={dailyNotes}
-                        onChange={(e) => setDailyNotes(e.target.value)}
-                     />
-                  </div>
+              <div className={`p-5 rounded-xl border ${gate.allowed ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
+                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-500 mb-2">Live execution status</h2>
+                <div className={`text-xl font-black ${gate.allowed ? 'text-emerald-700' : 'text-slate-700'}`}>
+                  {gate.allowed ? 'WINDOW OPEN' : 'WINDOW CLOSED / BLOCKED'}
                 </div>
-
-                <button 
-                  onClick={archiveDay}
-                  className="mt-4 w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-3 rounded-lg shadow transition-colors flex justify-center items-center gap-2"
+                <p className="text-xs text-slate-600 mt-2">
+                  Planning and sizing happen in <strong>Plan & Size</strong> (works before/after hours). Live mode only allows broker entries in approved windows.
+                </p>
+                <button
+                  onClick={() => setActiveTab('tools')}
+                  className="mt-3 w-full bg-slate-900 hover:bg-slate-800 text-white text-sm font-bold py-2.5 rounded-lg flex items-center justify-center gap-2"
                 >
-                  <Save className="h-4 w-4" />
-                  Save Day & Reset
+                  <Calculator className="h-4 w-4" />
+                  Go to Plan & Size
                 </button>
               </div>
 
+              <div className="bg-white p-5 rounded-xl border border-slate-200">
+                <h2 className="text-base font-bold mb-3 flex items-center gap-2">
+                  <Target className="h-5 w-5 text-indigo-500" />
+                  Watchlist snapshot
+                </h2>
+                {watchlist.length === 0 ? (
+                  <p className="text-xs text-slate-400">No tickers yet. Add them from Plan & Size.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {watchlist.slice(0, 6).map((w) => (
+                      <li key={w.id} className="flex justify-between items-center text-sm border-b border-slate-100 pb-1">
+                        <button onClick={() => loadTickerIntoPlanner(w)} className="font-mono font-bold text-indigo-700 hover:underline">{w.ticker}</button>
+                        <span className="text-[10px] uppercase text-slate-400">Grade {w.setupGrade}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              <div className="bg-white p-5 rounded-xl border border-slate-200">
+                <h2 className="text-sm font-bold text-slate-700 mb-2">Prep checklist status</h2>
+                <div className="text-xs space-y-1 text-slate-600">
+                  <div>1. IBKR snapshot: {routine.snapshotImported ? '✓' : '○'}</div>
+                  <div>2. Journal: {routine.journal ? '✓' : '○'}</div>
+                  <div>3. Alerts: {routine.alerts ? '✓' : '○'}</div>
+                  <div>4. Brackets: {routine.orders ? '✓' : '○'}</div>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-2">Snapshot is step 1 — Apply OCR above. Other toggles in Plan & Size.</p>
+              </div>
             </div>
 
           </div>
+          </div>
         )}
 
-        {/* --- TAB 2: ARCHIVE & BACKUP --- */}
+        {/* --- TAB 2: PLAN & SIZE (TOOLS) --- */}
+        {activeTab === 'tools' && (
+          <div className="space-y-4">
+            {/* Mode toggle */}
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1">
+                  Workspace mode <HelpIcon fieldId="workspaceMode" />
+                </div>
+                <p className="text-sm text-slate-600 mt-0.5">
+                  {workspaceMode === 'planning'
+                    ? 'Planning: ignore market hours — size and validate setups anytime.'
+                    : 'Live: enforce approved windows before execution is allowed.'}
+                </p>
+                {gate.warnings?.map((w) => (
+                  <p key={w} className="text-[11px] text-amber-700 mt-1 font-semibold">{w}</p>
+                ))}
+                {setupCapBlocked && (
+                  <p className="text-[11px] text-red-700 mt-1 font-semibold">
+                    Portfolio score caps setup at {portfolioScore.suggestedSetupCap} (score {portfolioScore.score}).
+                  </p>
+                )}
+              </div>
+              <div className="flex rounded-lg overflow-hidden border border-slate-300">
+                <button
+                  onClick={() => setWorkspaceMode('planning')}
+                  className={`px-4 py-2 text-sm font-bold ${workspaceMode === 'planning' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600'}`}
+                >
+                  Planning
+                </button>
+                <button
+                  onClick={() => setWorkspaceMode('live')}
+                  className={`px-4 py-2 text-sm font-bold ${workspaceMode === 'live' ? 'bg-emerald-600 text-white' : 'bg-white text-slate-600'}`}
+                >
+                  Live
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
+              {/* Left: Calculator + earnings + plan */}
+              <div className="md:col-span-5 space-y-6">
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                  <h2 className="text-base font-bold mb-3 flex items-center gap-2 text-slate-800">
+                    <Calculator className="text-blue-500 h-5 w-5" />
+                    Position Size Calculator
+                  </h2>
+                  <div className="text-xs text-slate-500 mb-3">
+                    1R base from Portfolio state: <span className="font-mono font-bold text-slate-800">${oneRValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                    {' · '}Setup factor: {gate.setupFactor}x
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mb-3">
+                    <div>
+                      <FieldHelp fieldId="entryPrice" label="Entry" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input type="number" step="0.01" value={entryPrice || ''} onChange={(e) => setEntryPrice(Number(e.target.value))} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="stopPrice" label="Stop" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input type="number" step="0.01" value={stopPrice || ''} onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setStopPrice(v);
+                        if (!originalStop) setOriginalStop(v);
+                      }} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="originalStop" label="Original Stop" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input type="number" step="0.01" value={originalStop || ''} onChange={(e) => setOriginalStop(Number(e.target.value))} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="tradeDirection" label="Direction" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <select value={tradeDirection} onChange={(e) => setTradeDirection(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
+                        <option value="long">Long</option>
+                        <option value="short">Short</option>
+                      </select>
+                    </div>
+                    <div className="col-span-2">
+                      <FieldHelp fieldId="requestedShares" label="Requested shares (optional)" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input type="number" value={requestedShares || ''} onChange={(e) => setRequestedShares(Number(e.target.value))} placeholder="0 = use max" className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
+                    </div>
+                  </div>
+                  <div className={`p-3 rounded-lg border text-sm ${!sizeReady ? 'bg-red-50 border-red-200 text-red-800' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>
+                    <div className="flex justify-between font-bold mb-1">
+                      <span>Max shares</span>
+                      <span className="font-mono">{planOrLiveReady ? positionSize.shares : 0}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span>Allowed risk</span>
+                      <span className="font-mono">${gate.allowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                    </div>
+                    <div className="flex justify-between text-xs mt-1">
+                      <span>Dollar risk @ size</span>
+                      <span className="font-mono">${(planOrLiveReady ? positionSize.dollarRisk : 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                    </div>
+                  </div>
+                  {positionSize.blockReasons.length > 0 && (
+                    <ul className="mt-2 space-y-1">
+                      {positionSize.blockReasons.map((r) => (
+                        <li key={r} className="text-[11px] text-red-700">• {r}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                  <h2 className="text-base font-bold mb-3 flex items-center gap-2 text-slate-800">
+                    <Shield className="text-amber-500 h-5 w-5" />
+                    Earnings / Event Risk
+                  </h2>
+                  <div className="space-y-2">
+                    <div>
+                      <FieldHelp fieldId="tradeTicker" label="Ticker" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input type="text" value={tradeTicker} onChange={(e) => setTradeTicker(e.target.value.toUpperCase())} placeholder="e.g. NVDA" className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50 uppercase" />
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer text-sm">
+                      <input type="checkbox" checked={earningsChecked} onChange={(e) => setEarningsChecked(e.target.checked)} />
+                      <span className="flex items-center gap-1">Earnings checked <HelpIcon fieldId="earningsChecked" /></span>
+                    </label>
+                    <div>
+                      <FieldHelp fieldId="earningsTiming" label="Earnings timing" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <select value={earningsTiming} onChange={(e) => setEarningsTiming(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
+                        <option value="none">None known</option>
+                        <option value="today">Today — BLOCK</option>
+                        <option value="tomorrow">Tomorrow — BLOCK</option>
+                        <option value="this_week">This week</option>
+                        <option value="unknown">Unknown — BLOCK</option>
+                      </select>
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer text-sm">
+                      <input type="checkbox" checked={highImpactEventPending} onChange={(e) => setHighImpactEventPending(e.target.checked)} />
+                      High-impact event pending
+                    </label>
+                    {highImpactEventPending && (
+                      <label className="flex items-center gap-2 cursor-pointer text-sm">
+                        <input type="checkbox" checked={highImpactEventApproved} onChange={(e) => setHighImpactEventApproved(e.target.checked)} />
+                        Explicitly approved in trade plan
+                      </label>
+                    )}
+                    <div>
+                      <label className="block text-[10px] text-slate-400 uppercase font-bold mb-1">Event notes</label>
+                      <input type="text" value={eventNotes} onChange={(e) => setEventNotes(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50" />
+                    </div>
+                  </div>
+
+                  <h3 className="text-xs font-bold text-indigo-700 uppercase tracking-wider mb-2 border-t pt-3 mt-4">Trade Plan Guardrails</h3>
+                  <div className="space-y-2">
+                    <div>
+                      <FieldHelp fieldId="setupGrade" label="Setup grade" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <select value={setupGrade} onChange={(e) => setSetupGrade(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
+                        <option value="A">A — full risk</option>
+                        <option value="B">B — 0.5× risk</option>
+                        <option value="C">C — no trade</option>
+                        <option value="no_trade">No Trade</option>
+                      </select>
+                      {routine.snapshotImported && (
+                        <p className="text-[10px] text-slate-500 mt-1">Portfolio suggests max: {portfolioScore.suggestedSetupCap}</p>
+                      )}
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer text-sm">
+                      <input type="checkbox" checked={isAdd} onChange={(e) => setIsAdd(e.target.checked)} />
+                      Add to existing position
+                    </label>
+                    {isAdd && (
+                      <>
+                        <select value={addType} onChange={(e) => setAddType(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50">
+                          <option value="not_allowed">Not allowed</option>
+                          <option value="winner_add">Winner add</option>
+                          <option value="loser_add">Loser add (pre-planned)</option>
+                        </select>
+                        <label className="flex items-center gap-2 cursor-pointer text-sm">
+                          <input type="checkbox" checked={addPrePlanned} onChange={(e) => setAddPrePlanned(e.target.checked)} />
+                          Add pre-planned before entry
+                        </label>
+                        <label className="flex items-center gap-2 cursor-pointer text-sm">
+                          <input type="checkbox" checked={positionIsLosing} onChange={(e) => setPositionIsLosing(e.target.checked)} />
+                          Position currently losing
+                        </label>
+                        <input type="number" step="0.1" value={combinedRiskR} onChange={(e) => setCombinedRiskR(Number(e.target.value))} className="w-full p-1.5 text-sm border rounded font-mono bg-slate-50" placeholder="Combined risk R" />
+                      </>
+                    )}
+                    <div className="grid grid-cols-2 gap-2">
+                      <input type="number" step="0.1" value={unrealizedGainPct} onChange={(e) => setUnrealizedGainPct(Number(e.target.value))} className="w-full p-1.5 text-sm border rounded font-mono bg-slate-50" placeholder="Unrealized %" />
+                      <input type="number" step="0.1" value={unrealizedR} onChange={(e) => setUnrealizedR(Number(e.target.value))} className="w-full p-1.5 text-sm border rounded font-mono bg-slate-50" placeholder="Unrealized R" />
+                    </div>
+                    <select value={profitProtectionPlan} onChange={(e) => setProfitProtectionPlan(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50">
+                      <option value="none">Profit plan: None</option>
+                      <option value="partial">Take partial profits</option>
+                      <option value="move_stop">Move stop to protection</option>
+                      <option value="preplanned_full_risk">Pre-planned full risk hold</option>
+                    </select>
+                    {tradePlan.profitProtectionRequired && (
+                      <div className="p-2 bg-amber-50 border border-amber-200 rounded text-[11px] text-amber-900 font-semibold">
+                        Profit protection required (+15% or +2R).
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Middle: Gate + watchlist */}
+              <div className="md:col-span-4 space-y-6">
+                <div className={`p-5 rounded-xl shadow-sm border ${planOrLiveReady ? 'bg-emerald-50 border-emerald-300' : 'bg-red-50 border-red-300'}`}>
+                  <h2 className="text-base font-bold mb-2 flex items-center gap-2">
+                    <Clock className={`h-5 w-5 ${planOrLiveReady ? 'text-emerald-700' : 'text-red-700'}`} />
+                    <span className={planOrLiveReady ? 'text-emerald-900' : 'text-red-900'}>
+                      {workspaceMode === 'planning' ? 'Plan Gate' : 'Live Gate'}
+                    </span>
+                    <HelpIcon fieldId="gateStatus" />
+                  </h2>
+                  <div className={`text-2xl font-black mb-2 ${planOrLiveReady ? 'text-emerald-700' : 'text-red-700'}`}>
+                    {workspaceMode === 'planning'
+                      ? (gate.planningReady ? 'PLAN READY' : 'PLAN BLOCKED')
+                      : (gate.allowed ? 'TRADING ALLOWED' : 'TRADING BLOCKED')}
+                  </div>
+                  <div className="text-xs font-semibold uppercase tracking-wider text-slate-600 mb-2">
+                    {workspaceMode} · {gate.phase} · IDT {gate.israelTimeLabel} / ET {gate.etTimeLabel}
+                  </div>
+                  {workspaceMode === 'planning' && gate.scheduleReasons.length > 0 && (
+                    <div className="mb-2 p-2 bg-indigo-50 border border-indigo-100 rounded text-[11px] text-indigo-800">
+                      Schedule note (ignored in planning): {gate.scheduleReasons[0]}
+                    </div>
+                  )}
+                  {gate.reasons.length > 0 && (
+                    <ul className="space-y-1 max-h-40 overflow-y-auto">
+                      {gate.reasons.map((reason) => (
+                        <li key={reason} className="text-xs text-red-800 flex gap-1.5">
+                          <Ban className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                          <span>{reason}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {tradePlan.warnings.map((w) => (
+                    <div key={w} className="mt-2 text-xs text-amber-800 flex gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />{w}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                  <h2 className="text-base font-bold mb-3 flex items-center gap-2">
+                    <Target className="h-5 w-5 text-indigo-500" />
+                    Watchlist
+                  </h2>
+                  <div className="flex gap-2 mb-3">
+                    <input
+                      type="text"
+                      value={watchNote}
+                      onChange={(e) => setWatchNote(e.target.value)}
+                      placeholder="Note for current ticker"
+                      className="flex-1 p-1.5 text-xs border rounded bg-slate-50"
+                    />
+                    <button onClick={addToWatchlist} className="px-3 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded hover:bg-indigo-700">
+                      Save
+                    </button>
+                  </div>
+                  {watchlist.length === 0 ? (
+                    <p className="text-xs text-slate-400">Set ticker above, then Save to watchlist.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {watchlist.map((w) => (
+                        <li key={w.id} className="flex items-center justify-between gap-2 text-sm border border-slate-100 rounded p-2">
+                          <button onClick={() => loadTickerIntoPlanner(w)} className="text-left">
+                            <div className="font-mono font-bold text-indigo-700">{w.ticker}</div>
+                            <div className="text-[10px] text-slate-500">{w.note || '—'} · Grade {w.setupGrade}</div>
+                          </button>
+                          <button onClick={() => removeFromWatchlist(w.id)} className="text-slate-400 hover:text-red-600">
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+
+              {/* Right: Actions / routine / journal */}
+              <div className="md:col-span-3 space-y-6">
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                  <h2 className="text-base font-bold mb-4 flex items-center gap-2 text-slate-800">
+                    <CheckCircle className="text-emerald-500 h-5 w-5" />
+                    Actions & Checklist
+                  </h2>
+                  <div className="space-y-3">
+                    <div>
+                      <h3 className="text-xs font-bold text-indigo-700 uppercase mb-2 flex items-center gap-1">
+                        1. IBKR Snapshot <HelpIcon fieldId="routineSnapshot" />
+                      </h3>
+                      <label className="flex items-center gap-2 mb-2 opacity-90">
+                        <div className="text-indigo-600">{routine.snapshotImported ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm">
+                          {routine.snapshotImported ? 'Snapshot applied' : 'Import on Portfolio & Market tab'}
+                        </span>
+                      </label>
+                      {!routine.snapshotImported && (
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab('state')}
+                          className="mb-2 text-[11px] font-bold text-indigo-700 underline"
+                        >
+                          Go to OCR import →
+                        </button>
+                      )}
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-bold text-blue-600 uppercase mb-2">2. Prep</h3>
+                      <label className="flex items-center gap-2 cursor-pointer mb-2">
+                        <div onClick={() => toggleRoutine('journal')} className="text-blue-500">{routine.journal ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm flex items-center gap-1">Tradervue tagging <HelpIcon fieldId="routineJournal" /></span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer mb-2">
+                        <div onClick={() => toggleRoutine('alerts')} className="text-blue-500">{routine.alerts ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm flex items-center gap-1">Set alerts <HelpIcon fieldId="routineAlerts" /></span>
+                      </label>
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-bold text-orange-600 uppercase mb-2">Execution window</h3>
+                      <label className="flex items-center gap-2 cursor-pointer mb-2">
+                        <div onClick={() => toggleRoutine('handsOff')} className="text-orange-500">{routine.handsOff ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm">Stayed in windows</span>
+                      </label>
+                      <label className={`flex items-center gap-2 mb-2 ${!gate.allowed ? 'opacity-50' : 'cursor-pointer'}`}>
+                        <div onClick={() => { if (gate.allowed) toggleRoutine('orders'); }} className="text-orange-500">{routine.orders ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm">Enter brackets {gate.allowed ? '' : '(live only)'}</span>
+                      </label>
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-bold text-indigo-600 uppercase mb-2">Post close</h3>
+                      <label className="flex items-center gap-2 cursor-pointer mb-2">
+                        <div onClick={() => toggleRoutine('reviewPos')} className="text-indigo-500">{routine.reviewPos ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm">Review positions</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <div onClick={() => toggleRoutine('moveStops')} className="text-indigo-500">{routine.moveStops ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
+                        <span className="text-sm">Trail stops</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                  <h2 className="text-sm font-bold mb-3">Daily journal</h2>
+                  <input type="date" value={journalDate} onChange={(e) => setJournalDate(e.target.value)} className="w-full mb-2 p-1.5 text-xs border rounded bg-slate-50 font-mono" />
+                  <select value={executionType} onChange={(e) => setExecutionType(e.target.value)} className="w-full mb-2 p-1.5 text-xs border rounded bg-slate-50">
+                    <option value="perfect">Perfect Plan Followed</option>
+                    <option value="mistake">Execution Mistake Made</option>
+                  </select>
+                  {executionType === 'mistake' && (
+                    <div className="bg-red-50 p-2 rounded border border-red-200 mb-2 space-y-1">
+                      <select value={mistakeCategory} onChange={(e) => setMistakeType(e.target.value)} className="w-full p-1 text-[11px] border border-red-300 rounded">
+                        <option value="none">Classification...</option>
+                        <option value="fomo">FOMO</option>
+                        <option value="chasing">Chasing</option>
+                        <option value="stop_down">Moved SL down</option>
+                        <option value="oversized">Oversized</option>
+                        <option value="early_exit">Early exit</option>
+                      </select>
+                      <input type="number" step="0.5" value={mistakeCostR} onChange={(e) => setMistakeCostR(Number(e.target.value))} placeholder="Cost R" className="w-full p-1 text-[11px] border border-red-300 rounded font-mono" />
+                      <input type="text" placeholder="1. Why?" value={fiveWs.w1} onChange={e => setFiveWs({...fiveWs, w1: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded" />
+                      <input type="text" placeholder="Solution" value={fiveWs.solution} onChange={e => setFiveWs({...fiveWs, solution: e.target.value})} className="w-full p-1 text-[10px] border border-emerald-300 bg-emerald-50 rounded" />
+                    </div>
+                  )}
+                  <textarea
+                    className="w-full h-20 p-2 text-xs border rounded bg-slate-50"
+                    placeholder="Session notes..."
+                    value={dailyNotes}
+                    onChange={(e) => setDailyNotes(e.target.value)}
+                  />
+                  <button onClick={archiveDay} className="mt-3 w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-2.5 rounded-lg text-sm flex justify-center items-center gap-2">
+                    <Save className="h-4 w-4" />
+                    Save Day & Reset
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* --- TAB 3: ARCHIVE & BACKUP --- */}
         {activeTab === 'archive' && (
           <div className="space-y-6">
             
@@ -792,6 +1779,17 @@ export default function App() {
                             <strong>Mistake Cost:</strong> -{entry.mistakeCostR}R (${(entry.mistakeCostR * entry.rValue).toLocaleString(undefined, {maximumFractionDigits: 0})})
                           </div>
                         )}
+
+                        {entry.gateAllowed != null && (
+                          <div className={`mb-3 p-2 rounded border text-[11px] ${entry.gateAllowed ? 'bg-emerald-50 border-emerald-100 text-emerald-800' : 'bg-amber-50 border-amber-100 text-amber-900'}`}>
+                            <strong>Gate:</strong> {entry.gateAllowed ? 'ALLOWED' : 'BLOCKED'}
+                            {entry.ticker ? ` · ${entry.ticker}` : ''}
+                            {entry.setupGrade ? ` · Grade ${entry.setupGrade}` : ''}
+                            {entry.gateReasons?.length ? (
+                              <div className="mt-1 opacity-80">{entry.gateReasons.slice(0, 3).join(' · ')}</div>
+                            ) : null}
+                          </div>
+                        )}
                         
                         {entry.notes ? (
                           <div className="text-xs text-slate-600 bg-white p-3 rounded border border-slate-100 italic whitespace-pre-wrap leading-relaxed">
@@ -908,6 +1906,10 @@ export default function App() {
                 <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded">
                   <h4 className="font-bold text-red-950 font-bold">Breaker D: Mental Stop-Loss Lock</h4>
                   <p className="text-sm text-red-800 mt-1"><strong>Rule:</strong> A physical stop-loss order can NEVER be adjusted downward. Any adjustment triggers immediate forced liquidation of the entire position.</p>
+                </div>
+                <div className="bg-violet-50 border-l-4 border-violet-500 p-4 rounded">
+                  <h4 className="font-bold text-violet-900">Breaker E: Schedule + Earnings Gate</h4>
+                  <p className="text-sm text-violet-800 mt-1"><strong>Rule:</strong> New trades only in approved IDT windows (17:00–18:00, 20:30–22:45) during US regular hours. Premarket/after-hours blocked. Earnings today/tomorrow/unknown blocks entry. Profit protection required at +15% or +2R.</p>
                 </div>
               </div>
             </BlueprintSection>
