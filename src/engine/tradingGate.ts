@@ -2,6 +2,7 @@ import type { RiskProfile } from './riskCalculator';
 import type { EventRiskResult } from './eventRisk';
 import type { TradePlanResult } from './tradePlanValidator';
 import { setupRiskFactor } from './positionSizer';
+import type { DisciplinePenaltyResult } from './disciplinePenalty';
 
 export type ScheduleWindow = {
   start: string; // HH:mm Israel time
@@ -37,6 +38,8 @@ export type TradingGateResult = {
   allowedRisk: number;
   setupFactor: number;
   snapshotStale: boolean;
+  disciplineFactor: number;
+  disciplineReason: string;
 };
 
 function parseHHmm(value: string): number {
@@ -118,6 +121,13 @@ export type TradingGateInput = {
   /** ISO timestamp of last applied IBKR snapshot */
   snapshotImportedAt?: string | null;
   nowMs?: number;
+  /** Locked plan required for Live execution */
+  planCommitted?: boolean;
+  /** Committed plan is deliberately no-trade / sit on hands */
+  sitOnHands?: boolean;
+  /** True when a prior Live session day was not archived yet (not same calendar day). */
+  needsPriorClose?: boolean;
+  discipline?: DisciplinePenaltyResult | null;
 };
 
 /**
@@ -150,6 +160,10 @@ export function getTradingGate(input: TradingGateInput): TradingGateResult {
     !Number.isFinite(snapAt) ||
     nowMs - snapAt > 18 * 60 * 60 * 1000;
 
+  const discipline = input.discipline;
+  const disciplineFactor = discipline?.factor ?? 1;
+  const disciplineReason = discipline?.reason || '';
+
   if (input.risk.isDailyMaxLossBreached) {
     processReasons.push('Daily max loss breached — stop trading.');
   }
@@ -160,33 +174,56 @@ export function getTradingGate(input: TradingGateInput): TradingGateResult {
     processReasons.push('Breaker B locked — QQQ below 50 SMA.');
   }
 
+  if (disciplineFactor === 0 && disciplineReason) {
+    processReasons.push(disciplineReason);
+  }
+
+  const sitOnHands = !!input.sitOnHands;
+
   // Routine required for Live execution only — planning can happen before prep is done.
   const requireRoutine = input.requireRoutine !== false && !isPlanning;
   if (requireRoutine) {
+    if (input.needsPriorClose) {
+      processReasons.push('Close prior Live session first — finish step 4 (Close day).');
+    }
     if (!input.routine.snapshotImported) {
       processReasons.push('IBKR snapshot not imported — complete start-of-day OCR step.');
     } else if (snapshotStale) {
       processReasons.push('IBKR snapshot is stale (>18h) — re-import Portfolio screenshot.');
     }
-    if (!input.routine.journal) processReasons.push('Journal / tagging not completed.');
-    if (!input.routine.alerts) processReasons.push('TradingView alerts not set.');
+    if (!input.planCommitted) {
+      processReasons.push('Trade plan not committed — lock plan in step 2.');
+    }
+    if (!input.routine.journal) {
+      processReasons.push('Pre-trade journal incomplete — commit plan with thesis + emotion.');
+    }
+    if (sitOnHands) {
+      processReasons.push('Sit-on-hands plan — no new risk today.');
+    } else if (!input.routine.alerts) {
+      processReasons.push('TradingView alerts not set.');
+    }
   } else if (isPlanning && snapshotStale) {
     warnings.push('IBKR snapshot missing or stale (>18h) — import before trusting size.');
   }
 
-  if (!input.eventRisk.allowed) {
-    processReasons.push(...input.eventRisk.reasons);
-  }
-  if (!input.tradePlan.allowed) {
-    processReasons.push(...input.tradePlan.reasons);
-  }
+  // Skip ticker/event/setup trade checks when the committed plan is sit-on-hands
+  if (!sitOnHands) {
+    if (!input.eventRisk.allowed) {
+      processReasons.push(...input.eventRisk.reasons);
+    }
+    if (!input.tradePlan.allowed) {
+      processReasons.push(...input.tradePlan.reasons);
+    }
 
-  const setupFactor = setupRiskFactor(input.setupGrade);
-  if (setupFactor <= 0) {
-    if (!processReasons.some((r) => r.includes('Setup grade'))) {
-      processReasons.push('Setup grade does not allow risk.');
+    const setupFactorCheck = setupRiskFactor(input.setupGrade);
+    if (setupFactorCheck <= 0) {
+      if (!processReasons.some((r) => r.includes('Setup grade'))) {
+        processReasons.push('Setup grade does not allow risk.');
+      }
     }
   }
+
+  const setupFactor = sitOnHands ? 0 : setupRiskFactor(input.setupGrade);
 
   const processOk = processReasons.length === 0;
   const scheduleOk = scheduleReasons.length === 0;
@@ -200,7 +237,12 @@ export function getTradingGate(input: TradingGateInput): TradingGateResult {
   else if (phase === 'premarket') mode = 'prep';
 
   const baseRisk = input.risk.oneRValue;
-  const allowedRisk = processOk ? baseRisk * setupFactor : 0;
+  const sizeFactor = processOk ? setupFactor * (disciplineFactor === 0 ? 0 : disciplineFactor) : 0;
+  const allowedRisk = processOk ? baseRisk * sizeFactor : 0;
+
+  if (processOk && disciplineFactor === 0.5 && disciplineReason) {
+    warnings.push(disciplineReason);
+  }
 
   const reasons = isPlanning
     ? [...new Set(processReasons)]
@@ -223,5 +265,7 @@ export function getTradingGate(input: TradingGateInput): TradingGateResult {
     allowedRisk,
     setupFactor,
     snapshotStale,
+    disciplineFactor,
+    disciplineReason,
   };
 }

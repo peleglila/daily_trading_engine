@@ -35,7 +35,9 @@ export const FIELD_HELP: Record<string, string> = {
   entryPrice: 'Planned entry price. Used with stop to compute share size from allowed risk.',
   stopPrice: 'Hard stop price. Dollar risk per share = |entry − stop|.',
   originalStop:
-    'First planned stop. Used to detect illegal stop widening (Breaker D).',
+    'Stop level frozen when you Commit. While drafting it mirrors Stop; after commit it cannot widen (Breaker D).',
+  sitOnHands:
+    'Deliberate no-trade plan. No ticker needed. Completes Plan step and blocks new risk for the day.',
   tradeDirection: 'Long or short. Determines which way a stop move reduces risk.',
   requestedShares:
     'Optional size check. Cannot exceed calculator max for allowed risk.',
@@ -77,4 +79,17 @@ export const FIELD_HELP: Record<string, string> = {
   routineOrders: 'Broker brackets only when Live gate allows (approved window).',
   ocrReview:
     'Always confirm OCR values. Screenshots misread K/M and minus signs — you are the final check.',
+  planCommit:
+    'Locks thesis, invalidation, entry, and original stop. Required before Live. Stop can only tighten after commit.',
+  planVoid:
+    'Clears the locked plan. Live size returns to 0 until you commit again.',
+  planThesis: 'One or two lines: why this trade exists. Required to commit.',
+  planInvalidation: 'What proves you wrong — exit condition. Required to commit.',
+  planEmotion: '1 calm … 5 tilted. Be honest. High emotion is a reason to skip.',
+  planNotRevenge: 'Confirm this is not a revenge trade after a loss or missed move.',
+  disciplineChip: 'Recent mistakes cut allowed risk. Fix process to restore full size.',
+  backupExport:
+    'Download JSON for your other PC (Drive/USB). Archive also auto-exports.',
+  noTradeToday: 'Mark when you intentionally skip trading — completes Execute/Close steps without a Live entry.',
+  todayFlow: 'One path: Snapshot → Plan & lock → Execute → Close day. Blueprint is reference only.',
 };

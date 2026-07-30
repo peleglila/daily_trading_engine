@@ -14,11 +14,14 @@ import { validateTradePlan } from './src/engine/tradePlanValidator';
 import { DEFAULT_SCHEDULE, getTradingGate } from './src/engine/tradingGate';
 import { emptySnapshot, parseIbkrPortfolioText } from './src/engine/ibkrOcrParser';
 import { computePortfolioRiskScore } from './src/engine/portfolioRiskScore';
+import { computeDisciplinePenalty } from './src/engine/disciplinePenalty';
 import { FieldHelp, HelpIcon } from './src/ui/FieldHelp';
+
+const todayISO = () => new Date().toISOString().split('T')[0];
 
 export default function App() {
   // --- STATE ---
-  // state = portfolio/market snapshot · tools = plan/size/actions · archive · blueprint
+  // Today flow: state=Snapshot · tools=Plan&lock · execute · archive=Close · blueprint
   const [activeTab, setActiveTab] = useState('state');
   const [nowTick, setNowTick] = useState(() => new Date());
   /** Planning: size & validate anytime. Live: enforce approved windows for execution. */
@@ -91,6 +94,19 @@ export default function App() {
   const [profitProtectionPlan, setProfitProtectionPlan] = useState('none');
   const [requestedShares, setRequestedShares] = useState(0);
 
+  // Locked plan + session close / backup
+  const [planCommitted, setPlanCommitted] = useState(false);
+  const [committedPlan, setCommittedPlan] = useState(null);
+  const [planThesis, setPlanThesis] = useState('');
+  const [planInvalidation, setPlanInvalidation] = useState('');
+  const [planEmotion, setPlanEmotion] = useState(3);
+  const [planNotRevenge, setPlanNotRevenge] = useState(false);
+  const [sessionTraded, setSessionTraded] = useState(false);
+  const [sessionTradeDate, setSessionTradeDate] = useState(null);
+  const [lastArchivedDate, setLastArchivedDate] = useState(null);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+  const [noTradeToday, setNoTradeToday] = useState(false);
+
   // Archive History
   const [history, setHistory] = useState([]);
 
@@ -149,6 +165,17 @@ export default function App() {
         if (g.routine) setRoutine((prev) => ({ ...prev, ...g.routine }));
         if (g.unrealizedOpenRisk != null) setUnrealizedOpenRisk(Number(g.unrealizedOpenRisk));
         if (g.dailyRealizedPL != null) setDailyRealizedPL(Number(g.dailyRealizedPL));
+        if (g.planCommitted != null) setPlanCommitted(!!g.planCommitted);
+        if (g.committedPlan) setCommittedPlan(g.committedPlan);
+        if (g.planThesis != null) setPlanThesis(g.planThesis);
+        if (g.planInvalidation != null) setPlanInvalidation(g.planInvalidation);
+        if (g.planEmotion != null) setPlanEmotion(Number(g.planEmotion));
+        if (g.planNotRevenge != null) setPlanNotRevenge(!!g.planNotRevenge);
+        if (g.sessionTraded != null) setSessionTraded(!!g.sessionTraded);
+        if (g.sessionTradeDate) setSessionTradeDate(g.sessionTradeDate);
+        if (g.lastArchivedDate) setLastArchivedDate(g.lastArchivedDate);
+        if (g.lastBackupAt) setLastBackupAt(g.lastBackupAt);
+        if (g.noTradeToday != null) setNoTradeToday(!!g.noTradeToday);
       } catch (e) {
         console.error('Failed to parse trade gate config');
       }
@@ -202,6 +229,17 @@ export default function App() {
       routine,
       unrealizedOpenRisk,
       dailyRealizedPL,
+      planCommitted,
+      committedPlan,
+      planThesis,
+      planInvalidation,
+      planEmotion,
+      planNotRevenge,
+      sessionTraded,
+      sessionTradeDate,
+      lastArchivedDate,
+      lastBackupAt,
+      noTradeToday,
     };
     localStorage.setItem('pelegTradeGateConfig', JSON.stringify(gateConfig));
   }, [
@@ -211,6 +249,8 @@ export default function App() {
     combinedRiskR, unrealizedGainPct, unrealizedR, profitProtectionPlan, requestedShares,
     workspaceMode, watchlist, unrealizedPL, excessLiquidity, buyingPower, maintMargin,
     positions, snapshotImportedAt, routine, unrealizedOpenRisk, dailyRealizedPL,
+    planCommitted, committedPlan, planThesis, planInvalidation, planEmotion, planNotRevenge,
+    sessionTraded, sessionTradeDate, lastArchivedDate, lastBackupAt, noTradeToday,
   ]);
 
   // Refresh clock for live gate status
@@ -272,6 +312,16 @@ export default function App() {
     profitProtectionPlan,
   });
 
+  const discipline = computeDisciplinePenalty(history, nowTick);
+  const needsPriorClose = !!(
+    sessionTraded &&
+    sessionTradeDate &&
+    lastArchivedDate !== sessionTradeDate
+  );
+  const dayClosedToday = lastArchivedDate === todayISO() || noTradeToday;
+
+  const sitOnHandsPlan = !!(planCommitted && committedPlan?.sitOnHands);
+
   const gate = getTradingGate({
     now: nowTick,
     schedule: tradingSchedule,
@@ -283,6 +333,10 @@ export default function App() {
     requireRoutine: true,
     workspaceMode,
     snapshotImportedAt,
+    planCommitted,
+    sitOnHands: sitOnHandsPlan,
+    needsPriorClose,
+    discipline,
   });
 
   const portfolioScore = computePortfolioRiskScore({
@@ -313,10 +367,21 @@ export default function App() {
 
   const planOrLiveReady = workspaceMode === 'planning' ? gate.planningReady : gate.allowed;
   const sizeReady = planOrLiveReady && positionSize.withinLimits;
+  const setupCapRank = { no_trade: 0, C: 1, B: 2, A: 3 };
+  const effectiveSetupCap =
+    setupCapRank[discipline.maxSetupCap] < setupCapRank[portfolioScore.suggestedSetupCap]
+      ? discipline.maxSetupCap
+      : portfolioScore.suggestedSetupCap;
   const setupCapBlocked =
     routine.snapshotImported &&
-    ({ no_trade: 0, C: 1, B: 2, A: 3 }[setupGrade] ?? 0) >
-      ({ no_trade: 0, C: 1, B: 2, A: 3 }[portfolioScore.suggestedSetupCap] ?? 3);
+    (setupCapRank[setupGrade] ?? 0) > (setupCapRank[effectiveSetupCap] ?? 3);
+
+  const step1Done = !!routine.snapshotImported && !gate.snapshotStale;
+  const step2Done = planCommitted;
+  const step3Done = gate.allowed || noTradeToday;
+  const step4Done = dayClosedToday;
+
+  const backupOverdue = !lastBackupAt || (Date.now() - Date.parse(lastBackupAt) > 7 * 24 * 60 * 60 * 1000);
 
   // --- DISCIPLINE ANALYTICS CALCULATIONS ---
   const totalLogs = history.length;
@@ -327,9 +392,109 @@ export default function App() {
   const totalDollarLeaks = history.reduce((sum, item) => sum + ((Number(item.mistakeCostR) || 0) * (Number(item.rValue) || 0)), 0);
 
   // --- ACTIONS ---
-  const toggleRoutine = (key) => setRoutine(prev => ({ ...prev, [key]: !prev[key] }));
+  const toggleRoutine = (key) => {
+    if (key === 'journal') return; // journal only via Commit plan
+    setRoutine((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      if (key === 'orders' && next.orders && gate.allowed) {
+        setSessionTraded(true);
+        setSessionTradeDate(todayISO());
+      }
+      return next;
+    });
+  };
+
+  const commitTradePlan = (opts = {}) => {
+    const sitOnHands = !!opts.sitOnHands;
+    const thesis = planThesis.trim();
+    const invalidation = planInvalidation.trim();
+
+    if (thesis.length < 8) {
+      alert(sitOnHands
+        ? 'Write why you are sitting on your hands (at least a sentence).'
+        : 'Write a short thesis (at least a sentence) before commit.');
+      return;
+    }
+    if (!sitOnHands && invalidation.length < 8) {
+      alert('Write invalidation before commit.');
+      return;
+    }
+    // Revenge confirm is required for trade plans only — optional for sit-on-hands
+    if (!sitOnHands && !planNotRevenge) {
+      alert('Confirm this is not a revenge trade.');
+      return;
+    }
+
+    if (sitOnHands) {
+      const plan = {
+        sitOnHands: true,
+        ticker: '',
+        direction: 'long',
+        entry: 0,
+        stop: 0,
+        originalStop: 0,
+        setupGrade: 'no_trade',
+        thesis,
+        invalidation: invalidation || 'No new risk — sit on hands.',
+        notRevenge: !!planNotRevenge,
+        emotion: planEmotion,
+        committedAt: new Date().toISOString(),
+      };
+      setSetupGrade('no_trade');
+      setCommittedPlan(plan);
+      setPlanCommitted(true);
+      setRoutine((prev) => ({ ...prev, journal: true }));
+      setNoTradeToday(true);
+      return;
+    }
+
+    if (!tradeTicker.trim()) {
+      alert('Enter a ticker before committing — or use “Sit on hands”.');
+      return;
+    }
+    if (!entryPrice || !stopPrice) {
+      alert('Entry and stop are required to commit a trade plan.');
+      return;
+    }
+    if (setupCapBlocked) {
+      alert(`Setup grade exceeds cap (${effectiveSetupCap}). Lower the grade first.`);
+      return;
+    }
+    const orig = stopPrice;
+    setOriginalStop(orig);
+    const plan = {
+      sitOnHands: false,
+      ticker: tradeTicker.toUpperCase(),
+      direction: tradeDirection,
+      entry: entryPrice,
+      stop: stopPrice,
+      originalStop: orig,
+      setupGrade,
+      thesis,
+      invalidation,
+      notRevenge: true,
+      emotion: planEmotion,
+      committedAt: new Date().toISOString(),
+    };
+    setCommittedPlan(plan);
+    setPlanCommitted(true);
+    setRoutine((prev) => ({ ...prev, journal: true }));
+    setNoTradeToday(false);
+  };
+
+  const voidTradePlan = () => {
+    if (!window.confirm('Void locked plan? Live size returns to 0 until you re-commit.')) return;
+    setPlanCommitted(false);
+    setCommittedPlan(null);
+    setRoutine((prev) => ({ ...prev, journal: false }));
+    setNoTradeToday(false);
+  };
 
   const loadTickerIntoPlanner = (item) => {
+    if (planCommitted) {
+      alert('Void the locked plan before loading another ticker.');
+      return;
+    }
     setTradeTicker(item.ticker || '');
     if (item.setupGrade) setSetupGrade(item.setupGrade);
     if (item.note) setEventNotes(item.note);
@@ -438,9 +603,24 @@ export default function App() {
   };
   
   const archiveDay = () => {
-    if (!window.confirm("Archive today's data and reset checklists?")) return;
+    const notesOk = dailyNotes.trim().length >= 20;
+    if (executionType === 'mistake') {
+      const wsOk = [fiveWs.w1, fiveWs.w2, fiveWs.w3, fiveWs.w4, fiveWs.w5, fiveWs.solution]
+        .every((x) => String(x || '').trim().length >= 2);
+      if (!wsOk || mistakeCategory === 'none') {
+        alert('Mistake close requires category + all 5 W’s + solution.');
+        return;
+      }
+    } else if (!notesOk) {
+      alert('Close day requires session notes (at least ~20 characters).');
+      return;
+    }
+    if (!executionType) {
+      alert('Select execution type (perfect or mistake).');
+      return;
+    }
+    if (!window.confirm("Archive today's data, download backup, and reset checklists?")) return;
 
-    // Handle manual date setting and convert to Israeli DD/MM/YYYY formatting
     const [y, m, d] = journalDate.split('-');
     const displayDate = `${d}/${m}/${y}`;
 
@@ -455,7 +635,7 @@ export default function App() {
       netLiq: currentEquity,
       peak: peakEquity,
       drawdown: drawdown.toFixed(2),
-      notes: compiledNotes || 'No notes entered for this session.',
+      notes: compiledNotes,
       regime: qqqStatus === 'above21' ? 'QQQ Bullish Trend' : qqqStatus === 'below21' ? 'QQQ Volatile/Warning' : 'QQQ Hostile Trend',
       riskTier: activeTier,
       riskPct: riskPercent,
@@ -474,10 +654,16 @@ export default function App() {
       earningsChecked,
       allowedRisk: gate.allowedRisk,
       calculatedShares: positionSize.shares,
+      committedPlan,
     };
-    
-    saveHistory([newEntry, ...history]);
-    
+
+    const nextHistory = [newEntry, ...history];
+    saveHistory(nextHistory);
+    setLastArchivedDate(journalDate);
+    setSessionTraded(false);
+    setSessionTradeDate(null);
+    setNoTradeToday(false);
+
     // Reset daily fields
     setDailyNotes('');
     setDailyRealizedPL(0);
@@ -486,7 +672,7 @@ export default function App() {
     setMistakeType('none');
     setMistakeCostR(0);
     setFiveWs({ w1: '', w2: '', w3: '', w4: '', w5: '', solution: '' });
-    setJournalDate(new Date().toISOString().split('T')[0]); // Reset date picker to current local date
+    setJournalDate(todayISO());
     setRoutine({
       snapshotImported: false,
       journal: false,
@@ -498,7 +684,18 @@ export default function App() {
     });
     setSnapshotImportedAt(null);
     setOcrDraft(null);
-    alert("Day archived successfully! Focus on the next small win.");
+    setPlanCommitted(false);
+    setCommittedPlan(null);
+    setPlanThesis('');
+    setPlanInvalidation('');
+    setPlanNotRevenge(false);
+    setPlanEmotion(3);
+    setWorkspaceMode('planning');
+
+    const backupAt = new Date().toISOString();
+    setLastBackupAt(backupAt);
+    exportDatabase({ historyOverride: nextHistory, lastBackupAtOverride: backupAt, lastArchivedDateOverride: journalDate });
+    alert('Day archived. Backup JSON downloaded — move it to Drive/USB for your other PC.');
   };
 
   const deleteEntry = (id) => {
@@ -517,15 +714,21 @@ export default function App() {
     alert(`Risk Upgraded! You secured your small wins. You are now operating under Level ${nextTier} parameters.`);
   };
 
-  const exportDatabase = () => {
+  const exportDatabase = (overrides = {}) => {
+    const hist = overrides.historyOverride ?? history;
+    const backupAt = overrides.lastBackupAtOverride ?? new Date().toISOString();
+    const archived = overrides.lastArchivedDateOverride ?? lastArchivedDate;
+    if (!overrides.lastBackupAtOverride) setLastBackupAt(backupAt);
     const backupData = {
-      history,
+      history: hist,
       peakEquity,
       currentEquity,
       last3R,
       manualRiskTier,
       qqqStatus,
       spyStatus,
+      lastBackupAt: backupAt,
+      lastArchivedDate: archived,
       tradeGateConfig: {
         tradingSchedule,
         tradeTicker,
@@ -559,6 +762,17 @@ export default function App() {
         routine,
         unrealizedOpenRisk,
         dailyRealizedPL,
+        planCommitted,
+        committedPlan,
+        planThesis,
+        planInvalidation,
+        planEmotion,
+        planNotRevenge,
+        sessionTraded,
+        sessionTradeDate,
+        lastArchivedDate: archived,
+        lastBackupAt: backupAt,
+        noTradeToday,
       },
     };
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData));
@@ -602,6 +816,17 @@ export default function App() {
     if (Array.isArray(g.positions)) setPositions(g.positions);
     if (g.snapshotImportedAt) setSnapshotImportedAt(g.snapshotImportedAt);
     if (g.routine) setRoutine((prev) => ({ ...prev, ...g.routine }));
+    if (g.planCommitted != null) setPlanCommitted(!!g.planCommitted);
+    if (g.committedPlan !== undefined) setCommittedPlan(g.committedPlan);
+    if (g.planThesis != null) setPlanThesis(g.planThesis);
+    if (g.planInvalidation != null) setPlanInvalidation(g.planInvalidation);
+    if (g.planEmotion != null) setPlanEmotion(Number(g.planEmotion));
+    if (g.planNotRevenge != null) setPlanNotRevenge(!!g.planNotRevenge);
+    if (g.sessionTraded != null) setSessionTraded(!!g.sessionTraded);
+    if (g.sessionTradeDate !== undefined) setSessionTradeDate(g.sessionTradeDate);
+    if (g.lastArchivedDate !== undefined) setLastArchivedDate(g.lastArchivedDate);
+    if (g.lastBackupAt !== undefined) setLastBackupAt(g.lastBackupAt);
+    if (g.noTradeToday != null) setNoTradeToday(!!g.noTradeToday);
   };
 
   const importDatabase = (e) => {
@@ -611,6 +836,8 @@ export default function App() {
       try {
         const parsed = JSON.parse(event.target.result);
         if (parsed.history) saveHistory(parsed.history);
+        if (parsed.lastBackupAt) setLastBackupAt(parsed.lastBackupAt);
+        if (parsed.lastArchivedDate) setLastArchivedDate(parsed.lastArchivedDate);
         if (parsed.peakEquity) setPeakEquity(parsed.peakEquity);
         if (parsed.currentEquity) setCurrentEquity(parsed.currentEquity);
         if (parsed.last3R) setLast3R(parsed.last3R);
@@ -651,39 +878,78 @@ export default function App() {
                 <Activity className="text-blue-400" />
                 Peleg Trading Engine OS
               </h1>
-              <p className="text-slate-400 text-sm mt-1">State · Plan & Size · Journal • IDT</p>
+              <p className="text-slate-400 text-sm mt-1 flex items-center gap-1">
+                Today flow <HelpIcon fieldId="todayFlow" /> · IDT {gate.israelTimeLabel}
+              </p>
             </div>
             <div className="text-left md:text-right bg-slate-800 p-3 rounded-lg border border-slate-700">
               <div className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Current Net Liq</div>
               <div className="text-2xl font-mono font-bold text-emerald-400">${currentEquity.toLocaleString()}</div>
             </div>
           </div>
+
+          {/* Sticky today-flow step strip */}
+          <div className="mb-2 grid grid-cols-2 md:grid-cols-4 gap-1.5">
+            {[
+              { id: 'state', n: 1, label: 'Snapshot', done: step1Done },
+              { id: 'tools', n: 2, label: 'Plan & lock', done: step2Done },
+              { id: 'execute', n: 3, label: 'Execute', done: step3Done },
+              { id: 'archive', n: 4, label: 'Close day', done: step4Done },
+            ].map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => setActiveTab(s.id)}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-left text-xs font-semibold border transition-colors ${
+                  activeTab === s.id
+                    ? 'bg-white text-slate-900 border-white'
+                    : s.done
+                      ? 'bg-emerald-900/40 text-emerald-200 border-emerald-700'
+                      : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
+                }`}
+              >
+                <span className={`flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-black ${
+                  s.done ? 'bg-emerald-500 text-white' : 'bg-slate-600 text-white'
+                }`}>
+                  {s.done ? '✓' : s.n}
+                </span>
+                {s.label}
+              </button>
+            ))}
+          </div>
           
           <div className="flex gap-1 overflow-x-auto no-scrollbar">
             <button 
               onClick={() => setActiveTab('state')}
-              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'state' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+              className={`px-4 py-2.5 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'state' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
               <Activity className="h-4 w-4" />
-              Portfolio & Market
+              1 Snapshot
             </button>
             <button 
               onClick={() => setActiveTab('tools')}
-              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'tools' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+              className={`px-4 py-2.5 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'tools' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
               <Calculator className="h-4 w-4" />
-              Plan & Size
+              2 Plan & lock
+            </button>
+            <button 
+              onClick={() => setActiveTab('execute')}
+              className={`px-4 py-2.5 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'execute' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+            >
+              <Zap className="h-4 w-4" />
+              3 Execute
             </button>
             <button 
               onClick={() => setActiveTab('archive')}
-              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'archive' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+              className={`px-4 py-2.5 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'archive' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
               <Calendar className="h-4 w-4" />
-              Journal ({history.length})
+              4 Close ({history.length})
             </button>
             <button 
               onClick={() => setActiveTab('blueprint')}
-              className={`px-5 py-3 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'blueprint' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+              className={`px-4 py-2.5 rounded-t-lg font-semibold text-sm transition-colors flex items-center gap-2 whitespace-nowrap ${activeTab === 'blueprint' ? 'bg-slate-50 text-slate-900' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'}`}
             >
               <FileText className="h-4 w-4" />
               Blueprint
@@ -700,16 +966,16 @@ export default function App() {
             <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-700 flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div>
                 <div className="text-xs uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1">
-                  Portfolio & Market State <HelpIcon fieldId="snapshotImport" />
+                  Step 1 — Snapshot <HelpIcon fieldId="snapshotImport" />
                 </div>
-                <p className="text-sm text-slate-300 mt-1">Start of day: import IBKR Portfolio screenshot, then review risk score.</p>
+                <p className="text-sm text-slate-300 mt-1">Import IBKR Portfolio, review numbers, Apply. Then go to Plan & lock.</p>
               </div>
               <button
                 onClick={() => setActiveTab('tools')}
-                className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-lg flex items-center gap-2"
+                disabled={!step1Done}
+                className={`text-sm font-bold px-4 py-2 rounded-lg flex items-center gap-2 ${step1Done ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-slate-700 text-slate-400 cursor-not-allowed'}`}
               >
-                <Calculator className="h-4 w-4" />
-                Open Plan & Size
+                Next: Plan & lock →
               </button>
             </div>
 
@@ -891,801 +1157,507 @@ export default function App() {
               </ul>
             </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-            
-            {/* COLUMN 1: Math & Limits (Left - 4 cols) */}
-            <div className="md:col-span-4 space-y-6">
-              
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-4">
               <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
                 <h2 className="text-base font-bold mb-4 flex items-center gap-2 text-slate-800">
                   <TrendingDown className="text-blue-500 h-5 w-5" />
-                  Equity Engine
+                  Equity
                 </h2>
-                <div className="space-y-4">
+                <div className="space-y-3">
                   <div>
-                    <FieldHelp fieldId="peakEquity" label="High-Water Mark (Peak)" />
-                    <input type="number" value={peakEquity} onChange={(e) => setPeakEquity(Number(e.target.value))} className="mt-1 w-full p-2 border border-slate-300 rounded-md font-mono focus:ring-blue-500 bg-slate-50" />
+                    <FieldHelp fieldId="peakEquity" label="Peak" />
+                    <input type="number" value={peakEquity} onChange={(e) => setPeakEquity(Number(e.target.value))} className="mt-1 w-full p-2 border rounded-md font-mono bg-slate-50" />
                   </div>
                   <div>
-                    <FieldHelp fieldId="currentEquity" label="Current Net Liq" />
-                    <input type="number" value={currentEquity} onChange={(e) => setCurrentEquity(Number(e.target.value))} className="mt-1 w-full p-2 border border-slate-300 rounded-md font-mono focus:ring-blue-500 bg-slate-50" />
+                    <FieldHelp fieldId="currentEquity" label="Net Liq" />
+                    <input type="number" value={currentEquity} onChange={(e) => setCurrentEquity(Number(e.target.value))} className="mt-1 w-full p-2 border rounded-md font-mono bg-slate-50" />
                   </div>
-                  
-                  <div className={`p-3 rounded-lg border flex justify-between items-center ${drawdown >= 15 ? 'bg-red-50 border-red-200 text-red-700' : drawdown > 0 ? 'bg-orange-50 border-orange-200 text-orange-700' : 'bg-green-50 border-green-200 text-green-700'}`}>
+                  <div className={`p-3 rounded-lg border flex justify-between ${drawdown >= 15 ? 'bg-red-50 border-red-200 text-red-700' : drawdown > 0 ? 'bg-orange-50 border-orange-200 text-orange-700' : 'bg-green-50 border-green-200 text-green-700'}`}>
                     <span className="font-semibold text-sm flex items-center gap-1">Drawdown <HelpIcon fieldId="drawdown" /></span>
-                    <span className="font-mono font-bold text-lg">{drawdown.toFixed(2)}%</span>
+                    <span className="font-mono font-bold">{drawdown.toFixed(2)}%</span>
+                  </div>
+                  <div className="flex justify-between text-sm border-t pt-2">
+                    <span className="flex items-center gap-1">1R <HelpIcon fieldId="oneR" /></span>
+                    <span className="font-mono font-bold">$${riskPercent > 0 ? oneRValue.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '0'}</span>
                   </div>
                 </div>
               </div>
 
-              <div className={`p-5 rounded-xl shadow-sm border relative ${riskStatus.color}`}>
-                {isRecoveryMode && (
-                  <div className="absolute -top-3 -right-2 bg-indigo-600 text-white text-[10px] font-bold px-2 py-1 rounded shadow-sm border border-indigo-400 uppercase tracking-wide animate-pulse">
-                    Recovery Override
+              <div className="bg-slate-800 p-5 rounded-xl text-white space-y-3">
+                <h2 className="text-xs font-bold text-slate-400 uppercase">Daily P&L / margin</h2>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <FieldHelp fieldId="dailyRealizedPL" label="Realized" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <input type="number" value={dailyRealizedPL} onChange={(e) => setDailyRealizedPL(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                  </div>
+                  <div>
+                    <FieldHelp fieldId="unrealizedPL" label="Unrealized" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <input type="number" value={unrealizedPL} onChange={(e) => setUnrealizedPL(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                  </div>
+                  <div>
+                    <FieldHelp fieldId="excessLiquidity" label="Excess" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <input type="number" value={excessLiquidity} onChange={(e) => setExcessLiquidity(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                  </div>
+                  <div>
+                    <FieldHelp fieldId="maintMargin" label="Maint" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <input type="number" value={maintMargin} onChange={(e) => setMaintMargin(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
+                  </div>
+                </div>
+                {positions.length > 0 && (
+                  <div>
+                    <FieldHelp fieldId="positions" label="Positions" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <ul className="mt-1 space-y-2 max-h-36 overflow-y-auto thin-scrollbar">
+                      {positions.map((p) => (
+                        <li key={p.ticker} className="text-[11px] font-mono text-slate-300 border border-slate-700 rounded p-1.5">
+                          <div className="flex justify-between"><span>{p.ticker} × {p.qty}</span><span>{p.pnl != null ? p.pnl.toLocaleString() : '—'}</span></div>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 )}
-                <h2 className="text-xs font-bold uppercase tracking-wider mb-1 opacity-80 flex items-center gap-1">Allowed Risk Per Trade <HelpIcon fieldId="oneR" /></h2>
-                <div className="text-3xl font-black mb-1">{riskStatus.risk}</div>
-                {riskStatus.msg && <div className="font-bold text-xs mb-3">{riskStatus.msg}</div>}
               </div>
+            </div>
 
-              <div className="bg-slate-800 p-5 rounded-xl shadow-sm text-white">
-                <h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Risk Parameters</h2>
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center border-b border-slate-700 pb-2">
-                    <span className="text-sm font-medium flex items-center gap-1">1R Base Value <HelpIcon fieldId="oneR" /></span>
-                    <span className="font-mono font-bold text-blue-400">
-                      ${riskPercent > 0 ? oneRValue.toLocaleString(undefined, {maximumFractionDigits: 0}) : '0'}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center border-b border-slate-700 pb-2">
-                    <span className="text-sm font-medium flex items-center gap-1 text-red-400">
-                      <AlertCircle className="h-4 w-4" /> Max Daily Loss <HelpIcon fieldId="dailyMaxLoss" />
-                    </span>
-                    <div className="text-right">
-                      <div className="font-mono font-bold text-red-400">-{dailyMaxLossR}R</div>
-                      <div className="text-xs text-slate-400">
-                        (${riskPercent > 0 ? dailyMaxLossDollar.toLocaleString(undefined, {maximumFractionDigits: 0}) : '0'})
-                      </div>
-                    </div>
-                  </div>
-                  <div>
-                    <FieldHelp fieldId="dailyRealizedPL" label="Today's Realized Session P&L ($)" labelClassName="text-[10px] text-slate-400 uppercase tracking-wider font-semibold" />
-                    <input 
-                      type="number" 
-                      value={dailyRealizedPL} 
-                      onChange={(e) => setDailyRealizedPL(Number(e.target.value))} 
-                      placeholder="e.g. -1200"
-                      className="mt-1 w-full p-2 border border-slate-700 bg-slate-900 rounded-md text-sm font-mono text-white focus:ring-blue-500" 
-                    />
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <FieldHelp fieldId="unrealizedPL" label="Unrealized P&L" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
-                      <input type="number" value={unrealizedPL} onChange={(e) => setUnrealizedPL(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
-                    </div>
-                    <div>
-                      <FieldHelp fieldId="excessLiquidity" label="Excess Liq" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
-                      <input type="number" value={excessLiquidity} onChange={(e) => setExcessLiquidity(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
-                    </div>
-                    <div>
-                      <FieldHelp fieldId="buyingPower" label="Buying Power" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
-                      <input type="number" value={buyingPower} onChange={(e) => setBuyingPower(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
-                    </div>
-                    <div>
-                      <FieldHelp fieldId="maintMargin" label="Maint Margin" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
-                      <input type="number" value={maintMargin} onChange={(e) => setMaintMargin(Number(e.target.value))} className="mt-1 w-full p-1.5 border border-slate-700 bg-slate-900 rounded text-xs font-mono text-white" />
-                    </div>
-                  </div>
-                  {positions.length > 0 && (
-                    <div>
-                      <FieldHelp fieldId="positions" label="Open Positions" labelClassName="text-[10px] text-slate-400 uppercase font-semibold" />
-                      <ul className="mt-1 space-y-2 max-h-40 overflow-y-auto overflow-x-hidden thin-scrollbar pr-0.5">
-                        {positions.map((p) => (
-                          <li key={p.ticker} className="text-[11px] font-mono text-slate-300 border border-slate-700 rounded p-1.5 space-y-1 min-w-0">
-                            <div className="flex justify-between gap-2">
-                              <span className="truncate">{p.ticker} × {p.qty}</span>
-                              <span className="shrink-0">{p.pnl != null ? p.pnl.toLocaleString() : '—'}</span>
-                            </div>
-                            <div className="grid grid-cols-2 gap-1 min-w-0">
-                              <div className="min-w-0">
-                                <span className="text-[9px] text-slate-500 uppercase flex items-center gap-0.5">Entry $ <HelpIcon fieldId="posEntryPrice" /></span>
-                                <input
-                                  type="number"
-                                  step="0.01"
-                                  value={p.entryPrice ?? ''}
-                                  onChange={(e) => {
-                                    const next = positions.map((row) =>
-                                      row.ticker === p.ticker ? { ...row, entryPrice: Number(e.target.value) } : row
-                                    );
-                                    setPositions(next);
-                                  }}
-                                  className="w-full min-w-0 p-1 border border-slate-700 bg-slate-900 rounded text-[10px] font-mono text-white"
-                                  placeholder="avg"
-                                />
-                              </div>
-                              <div className="min-w-0">
-                                <span className="text-[9px] text-slate-500 uppercase flex items-center gap-0.5">Entry date <HelpIcon fieldId="posEntryDate" /></span>
-                                <input
-                                  type="date"
-                                  value={p.entryDate || ''}
-                                  onChange={(e) => {
-                                    const next = positions.map((row) =>
-                                      row.ticker === p.ticker ? { ...row, entryDate: e.target.value } : row
-                                    );
-                                    setPositions(next);
-                                  }}
-                                  className="w-full min-w-0 p-1 border border-slate-700 bg-slate-900 rounded text-[10px] font-mono text-white"
-                                />
-                              </div>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                  {isDailyMaxLossBreached && (
-                    <div className="p-2 bg-red-900 border border-red-700 rounded text-xs font-bold text-red-100 flex items-center gap-1">
-                      <Ban className="h-4 w-4 shrink-0" />
-                      REALIZED MAX LOSS BREACHED! Stop trading.
-                    </div>
-                  )}
-                </div>
-              </div>
-
+            <div className="space-y-4">
               <div className="bg-white p-4 rounded-xl border border-slate-200">
                 <div className="text-[10px] uppercase font-bold text-slate-400 mb-1">Session clock</div>
                 <div className="flex justify-between text-sm font-mono font-bold">
                   <span>IDT {gate.israelTimeLabel}</span>
                   <span>ET {gate.etTimeLabel}</span>
                 </div>
-                <div className="text-xs text-slate-500 mt-1">Phase: {gate.phase} · Window: {gate.activeWindowLabel || 'none'}</div>
-                <div className="mt-2 space-y-1.5 text-xs text-slate-600">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-1">Unrealized P&L <HelpIcon fieldId="unrealizedPL" /></span>
-                    <span className={`font-mono font-bold ${unrealizedPL < 0 ? 'text-red-600' : unrealizedPL > 0 ? 'text-emerald-600' : ''}`}>
-                      {unrealizedPL < 0 ? '-' : ''}${Math.abs(unrealizedPL).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                    </span>
+                <div className="text-xs text-slate-500 mt-1">Phase: {gate.phase} · {gate.activeWindowLabel || 'no window'}</div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <span className={`text-[10px] font-bold px-2 py-1 rounded border ${step1Done ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>Snapshot {step1Done ? '✓' : '○'}</span>
+                  <span className={`text-[10px] font-bold px-2 py-1 rounded border ${planCommitted ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>Plan {planCommitted ? '✓' : '○'}</span>
+                  <span className={`text-[10px] font-bold px-2 py-1 rounded border ${discipline.factor < 1 ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>
+                    Disc <HelpIcon fieldId="disciplineChip" /> {discipline.factor}×
+                  </span>
+                </div>
+              </div>
+              <div className="bg-white p-4 rounded-xl border border-slate-200">
+                <h3 className="text-sm font-bold mb-2">Market regime</h3>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <FieldHelp fieldId="qqqStatus" label="QQQ" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <select value={qqqStatus} onChange={(e) => setQqqStatus(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
+                      <option value="above21">Above 21 EMA</option>
+                      <option value="below21">Below 21 EMA</option>
+                      <option value="below50">Below 50 SMA</option>
+                    </select>
                   </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-1">Open exposure <HelpIcon fieldId="unrealizedOpenRisk" /></span>
-                    <span className="font-mono font-bold">
-                      {oneRValue > 0 ? `${unrealizedOpenRisk}R` : '— (1R is $0)'}
-                    </span>
+                  <div>
+                    <FieldHelp fieldId="spyStatus" label="SPY" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <select value={spyStatus} onChange={(e) => setSpyStatus(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
+                      <option value="above21">Above 21 EMA</option>
+                      <option value="below21">Below 21 EMA</option>
+                    </select>
                   </div>
                 </div>
-                {oneRValue > 0 && (
-                  <input
-                    type="number"
-                    step="0.1"
-                    value={unrealizedOpenRisk}
-                    onChange={(e) => setUnrealizedOpenRisk(Number(e.target.value))}
-                    className="mt-2 w-full p-1.5 border rounded text-xs font-mono bg-slate-50"
-                    placeholder="Open exposure (R)"
-                  />
-                )}
               </div>
-
+              <button type="button" onClick={() => setActiveTab('tools')} className="w-full bg-slate-900 text-white font-bold py-2.5 rounded-lg text-sm">Continue to Plan & lock →</button>
             </div>
-
-            {/* COLUMN 2: Rules & Breakers (Middle - 4 cols) */}
-            <div className="md:col-span-4 space-y-6">
-
-              <div className="bg-orange-50 p-5 rounded-xl shadow-sm border border-orange-200">
-                <h2 className="text-base font-bold mb-3 flex items-center gap-2 text-orange-800">
-                  <ShieldAlert className="h-5 w-5" />
-                  Rules of Engagement
-                </h2>
-                <div className="text-xs text-orange-700 font-semibold mb-3 uppercase tracking-wider">
-                  Approved windows: 17:00–18:00 · 20:30–22:45 IDT · Regular hours only
-                </div>
-                <ul className="space-y-3">
-                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
-                    <span className="text-orange-500 font-bold">1.</span> 
-                    No premarket / after-hours new trades. Planned day trades in approved windows only.
-                  </li>
-                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
-                    <span className="text-orange-500 font-bold">2.</span> 
-                    Earnings checked before entry. Today / tomorrow / unknown = blocked.
-                  </li>
-                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
-                    <span className="text-orange-500 font-bold">3.</span> 
-                    A physical stop-loss order can NEVER be adjusted downward / wider.
-                  </li>
-                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
-                    <span className="text-orange-500 font-bold">4.</span> 
-                    No add-to-losers unless pre-planned. Size from calculator only.
-                  </li>
-                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
-                    <span className="text-orange-500 font-bold">5.</span> 
-                    At +15% or +2R protect profits. After +20% do not let winners become losers.
-                  </li>
-                  <li className="flex gap-2 text-sm text-slate-800 font-medium">
-                    <span className="text-orange-500 font-bold">6.</span> 
-                    Respect the daily -{dailyMaxLossR}R loss limit. Stop trading if hit.
-                  </li>
-                </ul>
-              </div>
-
-              {/* DISCIPLINE MISTAKE REGISTRY ANALYTICS */}
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-                <h2 className="text-base font-bold mb-4 flex items-center gap-2 text-indigo-800">
-                  <Award className="h-5 w-5" />
-                  Process & Discipline Analytics
-                </h2>
-                <div className="grid grid-cols-2 gap-3 mb-4">
-                  <div className="bg-slate-50 p-3 rounded border text-center">
-                    <div className="text-[10px] text-slate-400 uppercase font-bold">Discipline Score</div>
-                    <div className="text-2xl font-black text-slate-800">{disciplineScore.toFixed(0)}%</div>
-                    <div className="text-[10px] text-slate-500 mt-0.5">Perfect Executions</div>
-                  </div>
-                  <div className="bg-red-50 p-3 rounded border text-center border-red-100">
-                    <div className="text-[10px] text-red-500 uppercase font-bold">Cost of Mistakes</div>
-                    <div className="text-2xl font-black text-red-700 font-mono">-${totalDollarLeaks.toLocaleString(undefined, {maximumFractionDigits: 0})}</div>
-                    <div className="text-[10px] text-red-500 mt-0.5">-{totalRLeaks.toFixed(1)}R leaked</div>
-                  </div>
-                </div>
-                <p className="text-[11px] text-slate-500 leading-tight">
-                  By cataloging unwanted behaviors, the system exposes the exact dollar and R-multiple leaks drained from your portfolio.
-                </p>
-              </div>
-
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-                <h2 className="text-base font-bold mb-4 flex items-center gap-2 text-slate-800">
-                  <Activity className="text-indigo-500 h-5 w-5" />
-                  Circuit Breakers
-                </h2>
-
-                {/* Breaker B */}
-                <div className="mb-5 border-b pb-4">
-                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Breaker B: Market Regime</h3>
-                  <div className="grid grid-cols-2 gap-2 mb-3">
-                    <div>
-                      <FieldHelp fieldId="qqqStatus" label="QQQ" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <select value={qqqStatus} onChange={(e) => setQqqStatus(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded focus:ring-indigo-500 bg-slate-50">
-                        <option value="above21">Above 21 EMA</option>
-                        <option value="below21">Below 21 EMA</option>
-                        <option value="below50">Below 50 SMA</option>
-                      </select>
-                    </div>
-                    <div>
-                      <FieldHelp fieldId="spyStatus" label="SPY" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <select value={spyStatus} onChange={(e) => setSpyStatus(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded focus:ring-indigo-500 bg-slate-50">
-                        <option value="above21">Above 21 EMA</option>
-                        <option value="below21">Below 21 EMA</option>
-                        <option value="below50">Below 50 SMA</option>
-                      </select>
-                    </div>
-                  </div>
-                  {breakerBLocked && <div className="p-2 bg-red-100 text-red-800 rounded text-xs font-bold border border-red-200">LOCKED: QQQ below 50. Breakouts halted.</div>}
-                  {!breakerBLocked && breakerBWarning && <div className="p-2 bg-yellow-100 text-yellow-800 rounded text-xs font-bold border border-yellow-200">WARNING: Below 21 EMA. High selectivity.</div>}
-                </div>
-
-                {/* Breaker C - The Next Small Win */}
-                <div className={`p-4 rounded-lg border ${isDrawdown ? 'bg-indigo-50/50 border-indigo-100' : 'bg-slate-50/50 border-slate-100 opacity-60'}`}>
-                  <h3 className="text-[11px] font-bold text-indigo-700 uppercase tracking-wider mb-2 flex items-center justify-between">
-                    Breaker C: The Next Small Win (+2R)
-                    {isRecoveryMode && <Unlock className="h-3 w-3 text-indigo-500" />}
-                  </h3>
-                  
-                  <div className="flex flex-col gap-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="text-[11px] text-slate-500 font-medium flex flex-col">
-                        <span className="flex items-center gap-1">Closed R-Multiple <HelpIcon fieldId="last3R" /></span>
-                        <span className="text-[9px] text-amber-600 font-semibold">(Realized only)</span>
-                      </div>
-                      <input 
-                        type="number" 
-                        step="0.1" 
-                        value={last3R} 
-                        onChange={(e) => setLast3R(Number(e.target.value))} 
-                        disabled={!isDrawdown} 
-                        className="w-20 p-1.5 text-sm border rounded font-mono text-right bg-white" 
-                      />
-                    </div>
-
-                    {/* DYNAMIC LEVEL UP SYSTEM TRIGGER */}
-                    {isDrawdown && last3R >= 2 && activeTier > 0 && (
-                      <div className="pt-1">
-                        <button
-                          onClick={handleLevelUp}
-                          className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-3 rounded text-xs flex items-center justify-center gap-1.5 shadow-md animate-pulse"
-                        >
-                          <ArrowUpCircle className="h-4 w-4" />
-                          LEVEL UP: STEP RISK TO LEVEL {activeTier === 3 ? '2' : activeTier === 2 ? '1' : '0'}!
-                        </button>
-                      </div>
-                    )}
-                    
-                    {isDrawdown && (
-                      <div className="pt-2 border-t border-indigo-100">
-                        <FieldHelp fieldId="manualRiskTier" label="Active Risk Tier Override" labelClassName="text-[10px] font-bold text-slate-500 uppercase" />
-                        <select 
-                          value={manualRiskTier} 
-                          onChange={(e) => setManualRiskTier(e.target.value)}
-                          className={`mt-1 w-full p-1.5 text-sm border rounded font-medium ${breakerCActive && manualRiskTier !== 'auto' ? 'border-red-300 bg-red-50 text-red-700' : 'bg-white focus:ring-indigo-500'}`}
-                        >
-                          <option value="auto">Auto (Math: Lvl {strictTier})</option>
-                          <option value="2">Force Lvl 2 (0.5% - Max 2 Pos)</option>
-                          <option value="1">Force Lvl 1 (0.75% - Normal Pos)</option>
-                          <option value="0">Force Normal (1.0% - Margin OK)</option>
-                        </select>
-                        
-                        {breakerCActive && manualRiskTier !== 'auto' && (
-                          <div className="text-[10px] text-red-600 mt-1 font-bold leading-tight">
-                            Warning: Overriding tier before hitting +2R violates the foundation.
-                          </div>
-                        )}
-                        {!breakerCActive && manualRiskTier !== 'auto' && (
-                          <div className="text-[10px] text-indigo-600 mt-1 font-bold leading-tight">
-                            Recovery active. Goal: +2R to step up again. Focus on the small win.
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-            </div>
-
-            {/* COLUMN 3: State summary */}
-            <div className="md:col-span-4 space-y-6">
-              <div className={`p-5 rounded-xl border ${gate.allowed ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
-                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-500 mb-2">Live execution status</h2>
-                <div className={`text-xl font-black ${gate.allowed ? 'text-emerald-700' : 'text-slate-700'}`}>
-                  {gate.allowed ? 'WINDOW OPEN' : 'WINDOW CLOSED / BLOCKED'}
-                </div>
-                <p className="text-xs text-slate-600 mt-2">
-                  Planning and sizing happen in <strong>Plan & Size</strong> (works before/after hours). Live mode only allows broker entries in approved windows.
-                </p>
-                <button
-                  onClick={() => setActiveTab('tools')}
-                  className="mt-3 w-full bg-slate-900 hover:bg-slate-800 text-white text-sm font-bold py-2.5 rounded-lg flex items-center justify-center gap-2"
-                >
-                  <Calculator className="h-4 w-4" />
-                  Go to Plan & Size
-                </button>
-              </div>
-
-              <div className="bg-white p-5 rounded-xl border border-slate-200">
-                <h2 className="text-base font-bold mb-3 flex items-center gap-2">
-                  <Target className="h-5 w-5 text-indigo-500" />
-                  Watchlist snapshot
-                </h2>
-                {watchlist.length === 0 ? (
-                  <p className="text-xs text-slate-400">No tickers yet. Add them from Plan & Size.</p>
-                ) : (
-                  <ul className="space-y-2">
-                    {watchlist.slice(0, 6).map((w) => (
-                      <li key={w.id} className="flex justify-between items-center text-sm border-b border-slate-100 pb-1">
-                        <button onClick={() => loadTickerIntoPlanner(w)} className="font-mono font-bold text-indigo-700 hover:underline">{w.ticker}</button>
-                        <span className="text-[10px] uppercase text-slate-400">Grade {w.setupGrade}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-
-              <div className="bg-white p-5 rounded-xl border border-slate-200">
-                <h2 className="text-sm font-bold text-slate-700 mb-2">Prep checklist status</h2>
-                <div className="text-xs space-y-1 text-slate-600">
-                  <div>1. IBKR snapshot: {routine.snapshotImported ? '✓' : '○'}</div>
-                  <div>2. Journal: {routine.journal ? '✓' : '○'}</div>
-                  <div>3. Alerts: {routine.alerts ? '✓' : '○'}</div>
-                  <div>4. Brackets: {routine.orders ? '✓' : '○'}</div>
-                </div>
-                <p className="text-[11px] text-slate-400 mt-2">Snapshot is step 1 — Apply OCR above. Other toggles in Plan & Size.</p>
-              </div>
-            </div>
-
           </div>
           </div>
         )}
 
-        {/* --- TAB 2: PLAN & SIZE (TOOLS) --- */}
+        {/* --- TAB 2: PLAN & LOCK --- */}
         {activeTab === 'tools' && (
           <div className="space-y-4">
-            {/* Mode toggle */}
-            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-700 flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div>
-                <div className="text-xs uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1">
-                  Workspace mode <HelpIcon fieldId="workspaceMode" />
-                </div>
-                <p className="text-sm text-slate-600 mt-0.5">
-                  {workspaceMode === 'planning'
-                    ? 'Planning: ignore market hours — size and validate setups anytime.'
-                    : 'Live: enforce approved windows before execution is allowed.'}
-                </p>
-                {gate.warnings?.map((w) => (
-                  <p key={w} className="text-[11px] text-amber-700 mt-1 font-semibold">{w}</p>
-                ))}
+                <div className="text-xs uppercase tracking-wider text-slate-400 font-bold">Step 2 — Plan & lock</div>
+                <p className="text-sm text-slate-300 mt-1">Size the trade, check events, then Commit. Planning mode is on until Execute.</p>
                 {setupCapBlocked && (
-                  <p className="text-[11px] text-red-700 mt-1 font-semibold">
-                    Portfolio score caps setup at {portfolioScore.suggestedSetupCap} (score {portfolioScore.score}).
-                  </p>
+                  <p className="text-[11px] text-amber-300 mt-1 font-semibold">Setup capped at {effectiveSetupCap} (portfolio / discipline).</p>
                 )}
               </div>
-              <div className="flex rounded-lg overflow-hidden border border-slate-300">
-                <button
-                  onClick={() => setWorkspaceMode('planning')}
-                  className={`px-4 py-2 text-sm font-bold ${workspaceMode === 'planning' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600'}`}
-                >
-                  Planning
-                </button>
-                <button
-                  onClick={() => setWorkspaceMode('live')}
-                  className={`px-4 py-2 text-sm font-bold ${workspaceMode === 'live' ? 'bg-emerald-600 text-white' : 'bg-white text-slate-600'}`}
-                >
-                  Live
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => setActiveTab('execute')}
+                disabled={!step2Done}
+                className={`text-sm font-bold px-4 py-2 rounded-lg ${step2Done ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-slate-700 text-slate-400 cursor-not-allowed'}`}
+              >
+                Next: Execute →
+              </button>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-              {/* Left: Calculator + earnings + plan */}
-              <div className="md:col-span-5 space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-4">
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-                  <h2 className="text-base font-bold mb-3 flex items-center gap-2 text-slate-800">
+                  <h2 className="text-base font-bold mb-3 flex items-center gap-2">
                     <Calculator className="text-blue-500 h-5 w-5" />
-                    Position Size Calculator
+                    Position size
                   </h2>
                   <div className="text-xs text-slate-500 mb-3">
-                    1R base from Portfolio state: <span className="font-mono font-bold text-slate-800">${oneRValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                    {' · '}Setup factor: {gate.setupFactor}x
+                    1R $${oneRValue.toLocaleString(undefined, { maximumFractionDigits: 0 })} · Setup {gate.setupFactor}x
+                    {discipline.factor < 1 ? ` · Disc ${discipline.factor}x` : ''}
                   </div>
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div>
+                      <FieldHelp fieldId="tradeTicker" label="Ticker" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input type="text" value={tradeTicker} disabled={planCommitted} onChange={(e) => setTradeTicker(e.target.value.toUpperCase())} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50 uppercase disabled:opacity-60" />
+                    </div>
+                    <div>
+                      <FieldHelp fieldId="tradeDirection" label="Direction" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <select value={tradeDirection} disabled={planCommitted} onChange={(e) => setTradeDirection(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50 disabled:opacity-60">
+                        <option value="long">Long</option>
+                        <option value="short">Short</option>
+                      </select>
+                    </div>
+                    <div>
                       <FieldHelp fieldId="entryPrice" label="Entry" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <input type="number" step="0.01" value={entryPrice || ''} onChange={(e) => setEntryPrice(Number(e.target.value))} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
+                      <input type="number" step="0.01" value={entryPrice || ''} disabled={planCommitted} onChange={(e) => setEntryPrice(Number(e.target.value))} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50 disabled:opacity-60" />
                     </div>
                     <div>
                       <FieldHelp fieldId="stopPrice" label="Stop" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
                       <input type="number" step="0.01" value={stopPrice || ''} onChange={(e) => {
                         const v = Number(e.target.value);
                         setStopPrice(v);
-                        if (!originalStop) setOriginalStop(v);
+                        // Before commit, keep original in sync with stop (avoids freezing at first digit typed)
+                        if (!planCommitted) setOriginalStop(v);
                       }} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
                     </div>
                     <div>
-                      <FieldHelp fieldId="originalStop" label="Original Stop" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <input type="number" step="0.01" value={originalStop || ''} onChange={(e) => setOriginalStop(Number(e.target.value))} className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
+                      <FieldHelp fieldId="originalStop" label="Original stop" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={planCommitted ? (originalStop || '') : (stopPrice || originalStop || '')}
+                        disabled
+                        readOnly
+                        className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-100 text-slate-600"
+                      />
+                      <p className="text-[10px] text-slate-400 mt-0.5">Frozen at Commit — used to block stop widening.</p>
                     </div>
-                    <div>
-                      <FieldHelp fieldId="tradeDirection" label="Direction" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <select value={tradeDirection} onChange={(e) => setTradeDirection(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
-                        <option value="long">Long</option>
-                        <option value="short">Short</option>
-                      </select>
-                    </div>
-                    <div className="col-span-2">
-                      <FieldHelp fieldId="requestedShares" label="Requested shares (optional)" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <input type="number" value={requestedShares || ''} onChange={(e) => setRequestedShares(Number(e.target.value))} placeholder="0 = use max" className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50" />
-                    </div>
-                  </div>
-                  <div className={`p-3 rounded-lg border text-sm ${!sizeReady ? 'bg-red-50 border-red-200 text-red-800' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>
-                    <div className="flex justify-between font-bold mb-1">
-                      <span>Max shares</span>
-                      <span className="font-mono">{planOrLiveReady ? positionSize.shares : 0}</span>
-                    </div>
-                    <div className="flex justify-between text-xs">
-                      <span>Allowed risk</span>
-                      <span className="font-mono">${gate.allowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                    </div>
-                    <div className="flex justify-between text-xs mt-1">
-                      <span>Dollar risk @ size</span>
-                      <span className="font-mono">${(planOrLiveReady ? positionSize.dollarRisk : 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                    </div>
-                  </div>
-                  {positionSize.blockReasons.length > 0 && (
-                    <ul className="mt-2 space-y-1">
-                      {positionSize.blockReasons.map((r) => (
-                        <li key={r} className="text-[11px] text-red-700">• {r}</li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-
-                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-                  <h2 className="text-base font-bold mb-3 flex items-center gap-2 text-slate-800">
-                    <Shield className="text-amber-500 h-5 w-5" />
-                    Earnings / Event Risk
-                  </h2>
-                  <div className="space-y-2">
-                    <div>
-                      <FieldHelp fieldId="tradeTicker" label="Ticker" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <input type="text" value={tradeTicker} onChange={(e) => setTradeTicker(e.target.value.toUpperCase())} placeholder="e.g. NVDA" className="mt-1 w-full p-1.5 text-sm border rounded font-mono bg-slate-50 uppercase" />
-                    </div>
-                    <label className="flex items-center gap-2 cursor-pointer text-sm">
-                      <input type="checkbox" checked={earningsChecked} onChange={(e) => setEarningsChecked(e.target.checked)} />
-                      <span className="flex items-center gap-1">Earnings checked <HelpIcon fieldId="earningsChecked" /></span>
-                    </label>
-                    <div>
-                      <FieldHelp fieldId="earningsTiming" label="Earnings timing" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <select value={earningsTiming} onChange={(e) => setEarningsTiming(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
-                        <option value="none">None known</option>
-                        <option value="today">Today — BLOCK</option>
-                        <option value="tomorrow">Tomorrow — BLOCK</option>
-                        <option value="this_week">This week</option>
-                        <option value="unknown">Unknown — BLOCK</option>
-                      </select>
-                    </div>
-                    <label className="flex items-center gap-2 cursor-pointer text-sm">
-                      <input type="checkbox" checked={highImpactEventPending} onChange={(e) => setHighImpactEventPending(e.target.checked)} />
-                      High-impact event pending
-                    </label>
-                    {highImpactEventPending && (
-                      <label className="flex items-center gap-2 cursor-pointer text-sm">
-                        <input type="checkbox" checked={highImpactEventApproved} onChange={(e) => setHighImpactEventApproved(e.target.checked)} />
-                        Explicitly approved in trade plan
-                      </label>
-                    )}
-                    <div>
-                      <label className="block text-[10px] text-slate-400 uppercase font-bold mb-1">Event notes</label>
-                      <input type="text" value={eventNotes} onChange={(e) => setEventNotes(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50" />
-                    </div>
-                  </div>
-
-                  <h3 className="text-xs font-bold text-indigo-700 uppercase tracking-wider mb-2 border-t pt-3 mt-4">Trade Plan Guardrails</h3>
-                  <div className="space-y-2">
                     <div>
                       <FieldHelp fieldId="setupGrade" label="Setup grade" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
-                      <select value={setupGrade} onChange={(e) => setSetupGrade(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50">
+                      <select value={setupGrade} disabled={planCommitted} onChange={(e) => setSetupGrade(e.target.value)} className="mt-1 w-full p-1.5 text-sm border rounded bg-slate-50 disabled:opacity-60">
                         <option value="A">A — full risk</option>
                         <option value="B">B — 0.5× risk</option>
                         <option value="C">C — no trade</option>
                         <option value="no_trade">No Trade</option>
                       </select>
-                      {routine.snapshotImported && (
-                        <p className="text-[10px] text-slate-500 mt-1">Portfolio suggests max: {portfolioScore.suggestedSetupCap}</p>
-                      )}
                     </div>
-                    <label className="flex items-center gap-2 cursor-pointer text-sm">
-                      <input type="checkbox" checked={isAdd} onChange={(e) => setIsAdd(e.target.checked)} />
-                      Add to existing position
-                    </label>
-                    {isAdd && (
-                      <>
-                        <select value={addType} onChange={(e) => setAddType(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50">
-                          <option value="not_allowed">Not allowed</option>
-                          <option value="winner_add">Winner add</option>
-                          <option value="loser_add">Loser add (pre-planned)</option>
-                        </select>
-                        <label className="flex items-center gap-2 cursor-pointer text-sm">
-                          <input type="checkbox" checked={addPrePlanned} onChange={(e) => setAddPrePlanned(e.target.checked)} />
-                          Add pre-planned before entry
-                        </label>
-                        <label className="flex items-center gap-2 cursor-pointer text-sm">
-                          <input type="checkbox" checked={positionIsLosing} onChange={(e) => setPositionIsLosing(e.target.checked)} />
-                          Position currently losing
-                        </label>
-                        <input type="number" step="0.1" value={combinedRiskR} onChange={(e) => setCombinedRiskR(Number(e.target.value))} className="w-full p-1.5 text-sm border rounded font-mono bg-slate-50" placeholder="Combined risk R" />
-                      </>
-                    )}
-                    <div className="grid grid-cols-2 gap-2">
-                      <input type="number" step="0.1" value={unrealizedGainPct} onChange={(e) => setUnrealizedGainPct(Number(e.target.value))} className="w-full p-1.5 text-sm border rounded font-mono bg-slate-50" placeholder="Unrealized %" />
-                      <input type="number" step="0.1" value={unrealizedR} onChange={(e) => setUnrealizedR(Number(e.target.value))} className="w-full p-1.5 text-sm border rounded font-mono bg-slate-50" placeholder="Unrealized R" />
-                    </div>
-                    <select value={profitProtectionPlan} onChange={(e) => setProfitProtectionPlan(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50">
-                      <option value="none">Profit plan: None</option>
-                      <option value="partial">Take partial profits</option>
-                      <option value="move_stop">Move stop to protection</option>
-                      <option value="preplanned_full_risk">Pre-planned full risk hold</option>
-                    </select>
-                    {tradePlan.profitProtectionRequired && (
-                      <div className="p-2 bg-amber-50 border border-amber-200 rounded text-[11px] text-amber-900 font-semibold">
-                        Profit protection required (+15% or +2R).
-                      </div>
-                    )}
                   </div>
-                </div>
-              </div>
-
-              {/* Middle: Gate + watchlist */}
-              <div className="md:col-span-4 space-y-6">
-                <div className={`p-5 rounded-xl shadow-sm border ${planOrLiveReady ? 'bg-emerald-50 border-emerald-300' : 'bg-red-50 border-red-300'}`}>
-                  <h2 className="text-base font-bold mb-2 flex items-center gap-2">
-                    <Clock className={`h-5 w-5 ${planOrLiveReady ? 'text-emerald-700' : 'text-red-700'}`} />
-                    <span className={planOrLiveReady ? 'text-emerald-900' : 'text-red-900'}>
-                      {workspaceMode === 'planning' ? 'Plan Gate' : 'Live Gate'}
-                    </span>
-                    <HelpIcon fieldId="gateStatus" />
-                  </h2>
-                  <div className={`text-2xl font-black mb-2 ${planOrLiveReady ? 'text-emerald-700' : 'text-red-700'}`}>
-                    {workspaceMode === 'planning'
-                      ? (gate.planningReady ? 'PLAN READY' : 'PLAN BLOCKED')
-                      : (gate.allowed ? 'TRADING ALLOWED' : 'TRADING BLOCKED')}
+                  <div className={`p-3 rounded-lg border text-sm ${positionSize.shares > 0 && gate.allowedRisk > 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
+                    <div className="flex justify-between font-bold"><span>Max shares (preview)</span><span className="font-mono">{positionSize.shares}</span></div>
+                    <div className="flex justify-between text-xs mt-1"><span>Allowed risk</span><span className="font-mono">$${gate.allowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></div>
                   </div>
-                  <div className="text-xs font-semibold uppercase tracking-wider text-slate-600 mb-2">
-                    {workspaceMode} · {gate.phase} · IDT {gate.israelTimeLabel} / ET {gate.etTimeLabel}
-                  </div>
-                  {workspaceMode === 'planning' && gate.scheduleReasons.length > 0 && (
-                    <div className="mb-2 p-2 bg-indigo-50 border border-indigo-100 rounded text-[11px] text-indigo-800">
-                      Schedule note (ignored in planning): {gate.scheduleReasons[0]}
-                    </div>
-                  )}
-                  {gate.reasons.length > 0 && (
-                    <ul className="space-y-1 max-h-40 overflow-y-auto">
-                      {gate.reasons.map((reason) => (
-                        <li key={reason} className="text-xs text-red-800 flex gap-1.5">
-                          <Ban className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-                          <span>{reason}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                  {tradePlan.warnings.map((w) => (
-                    <div key={w} className="mt-2 text-xs text-amber-800 flex gap-1.5">
-                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />{w}
-                    </div>
+                  {tradePlan.reasons.map((r) => (
+                    <div key={r} className="mt-2 text-[11px] text-red-700">• {r}</div>
                   ))}
                 </div>
 
-                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                  <h2 className="text-base font-bold mb-3 flex items-center gap-2">
-                    <Target className="h-5 w-5 text-indigo-500" />
-                    Watchlist
-                  </h2>
-                  <div className="flex gap-2 mb-3">
-                    <input
-                      type="text"
-                      value={watchNote}
-                      onChange={(e) => setWatchNote(e.target.value)}
-                      placeholder="Note for current ticker"
-                      className="flex-1 p-1.5 text-xs border rounded bg-slate-50"
-                    />
-                    <button onClick={addToWatchlist} className="px-3 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded hover:bg-indigo-700">
-                      Save
-                    </button>
-                  </div>
-                  {watchlist.length === 0 ? (
-                    <p className="text-xs text-slate-400">Set ticker above, then Save to watchlist.</p>
-                  ) : (
-                    <ul className="space-y-2">
-                      {watchlist.map((w) => (
-                        <li key={w.id} className="flex items-center justify-between gap-2 text-sm border border-slate-100 rounded p-2">
-                          <button onClick={() => loadTickerIntoPlanner(w)} className="text-left">
-                            <div className="font-mono font-bold text-indigo-700">{w.ticker}</div>
-                            <div className="text-[10px] text-slate-500">{w.note || '—'} · Grade {w.setupGrade}</div>
-                          </button>
-                          <button onClick={() => removeFromWatchlist(w.id)} className="text-slate-400 hover:text-red-600">
-                            <Trash2 className="h-4 w-4" />
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
+                <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-2">
+                  <h2 className="text-base font-bold flex items-center gap-2"><Shield className="text-amber-500 h-5 w-5" /> Earnings / event</h2>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={earningsChecked} disabled={planCommitted} onChange={(e) => setEarningsChecked(e.target.checked)} />
+                    <span className="flex items-center gap-1">Earnings checked <HelpIcon fieldId="earningsChecked" /></span>
+                  </label>
+                  <select value={earningsTiming} disabled={planCommitted} onChange={(e) => setEarningsTiming(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50 disabled:opacity-60">
+                    <option value="none">None known</option>
+                    <option value="today">Today — BLOCK</option>
+                    <option value="tomorrow">Tomorrow — BLOCK</option>
+                    <option value="this_week">This week</option>
+                    <option value="unknown">Unknown — BLOCK</option>
+                  </select>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={highImpactEventPending} disabled={planCommitted} onChange={(e) => setHighImpactEventPending(e.target.checked)} />
+                    High-impact event pending
+                  </label>
+                  {highImpactEventPending && (
+                    <label className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={highImpactEventApproved} disabled={planCommitted} onChange={(e) => setHighImpactEventApproved(e.target.checked)} />
+                      Explicitly approved in plan
+                    </label>
                   )}
+                  <details className="text-xs pt-2">
+                    <summary className="cursor-pointer text-slate-500 font-semibold">Adds / profit protection (optional)</summary>
+                    <div className="mt-2 space-y-2">
+                      <label className="flex items-center gap-2"><input type="checkbox" checked={isAdd} disabled={planCommitted} onChange={(e) => setIsAdd(e.target.checked)} /> Add to position</label>
+                      {isAdd && (
+                        <>
+                          <select value={addType} disabled={planCommitted} onChange={(e) => setAddType(e.target.value)} className="w-full p-1.5 border rounded bg-slate-50">
+                            <option value="not_allowed">Not allowed</option>
+                            <option value="winner_add">Winner add</option>
+                            <option value="loser_add">Loser add (pre-planned)</option>
+                          </select>
+                          <label className="flex items-center gap-2"><input type="checkbox" checked={addPrePlanned} disabled={planCommitted} onChange={(e) => setAddPrePlanned(e.target.checked)} /> Pre-planned</label>
+                        </>
+                      )}
+                      <select value={profitProtectionPlan} disabled={planCommitted} onChange={(e) => setProfitProtectionPlan(e.target.value)} className="w-full p-1.5 border rounded bg-slate-50">
+                        <option value="none">Profit plan: None</option>
+                        <option value="partial">Take partials</option>
+                        <option value="move_stop">Move stop</option>
+                        <option value="preplanned_full_risk">Pre-planned full risk</option>
+                      </select>
+                    </div>
+                  </details>
                 </div>
               </div>
 
-              {/* Right: Actions / routine / journal */}
-              <div className="md:col-span-3 space-y-6">
-                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-                  <h2 className="text-base font-bold mb-4 flex items-center gap-2 text-slate-800">
-                    <CheckCircle className="text-emerald-500 h-5 w-5" />
-                    Actions & Checklist
+              <div className="space-y-4">
+                <div className="bg-indigo-50 border border-indigo-200 p-5 rounded-xl space-y-3">
+                  <h2 className="text-base font-bold flex items-center gap-2 text-indigo-900">
+                    Lock plan <HelpIcon fieldId="planCommit" />
                   </h2>
-                  <div className="space-y-3">
-                    <div>
-                      <h3 className="text-xs font-bold text-indigo-700 uppercase mb-2 flex items-center gap-1">
-                        1. IBKR Snapshot <HelpIcon fieldId="routineSnapshot" />
-                      </h3>
-                      <label className="flex items-center gap-2 mb-2 opacity-90">
-                        <div className="text-indigo-600">{routine.snapshotImported ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm">
-                          {routine.snapshotImported ? 'Snapshot applied' : 'Import on Portfolio & Market tab'}
-                        </span>
-                      </label>
-                      {!routine.snapshotImported && (
-                        <button
-                          type="button"
-                          onClick={() => setActiveTab('state')}
-                          className="mb-2 text-[11px] font-bold text-indigo-700 underline"
-                        >
-                          Go to OCR import →
-                        </button>
-                      )}
-                    </div>
-                    <div>
-                      <h3 className="text-xs font-bold text-blue-600 uppercase mb-2">2. Prep</h3>
-                      <label className="flex items-center gap-2 cursor-pointer mb-2">
-                        <div onClick={() => toggleRoutine('journal')} className="text-blue-500">{routine.journal ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm flex items-center gap-1">Tradervue tagging <HelpIcon fieldId="routineJournal" /></span>
-                      </label>
-                      <label className="flex items-center gap-2 cursor-pointer mb-2">
-                        <div onClick={() => toggleRoutine('alerts')} className="text-blue-500">{routine.alerts ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm flex items-center gap-1">Set alerts <HelpIcon fieldId="routineAlerts" /></span>
-                      </label>
-                    </div>
-                    <div>
-                      <h3 className="text-xs font-bold text-orange-600 uppercase mb-2">Execution window</h3>
-                      <label className="flex items-center gap-2 cursor-pointer mb-2">
-                        <div onClick={() => toggleRoutine('handsOff')} className="text-orange-500">{routine.handsOff ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm">Stayed in windows</span>
-                      </label>
-                      <label className={`flex items-center gap-2 mb-2 ${!gate.allowed ? 'opacity-50' : 'cursor-pointer'}`}>
-                        <div onClick={() => { if (gate.allowed) toggleRoutine('orders'); }} className="text-orange-500">{routine.orders ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm">Enter brackets {gate.allowed ? '' : '(live only)'}</span>
-                      </label>
-                    </div>
-                    <div>
-                      <h3 className="text-xs font-bold text-indigo-600 uppercase mb-2">Post close</h3>
-                      <label className="flex items-center gap-2 cursor-pointer mb-2">
-                        <div onClick={() => toggleRoutine('reviewPos')} className="text-indigo-500">{routine.reviewPos ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm">Review positions</span>
-                      </label>
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <div onClick={() => toggleRoutine('moveStops')} className="text-indigo-500">{routine.moveStops ? <CheckSquare className="w-4 h-4"/> : <Square className="w-4 h-4 text-slate-300"/>}</div>
-                        <span className="text-sm">Trail stops</span>
-                      </label>
-                    </div>
-                  </div>
+                  {!planCommitted ? (
+                    <>
+                      <div>
+                        <FieldHelp fieldId="planThesis" label="Thesis" labelClassName="text-[10px] text-indigo-700 uppercase font-bold" />
+                        <textarea value={planThesis} onChange={(e) => setPlanThesis(e.target.value)} rows={2} className="mt-1 w-full p-2 text-sm border rounded bg-white" placeholder="Why this trade? Or why sit on hands?" />
+                      </div>
+                      <div>
+                        <FieldHelp fieldId="planInvalidation" label="Invalidation" labelClassName="text-[10px] text-indigo-700 uppercase font-bold" />
+                        <textarea value={planInvalidation} onChange={(e) => setPlanInvalidation(e.target.value)} rows={2} className="mt-1 w-full p-2 text-sm border rounded bg-white" placeholder="What proves me wrong? (optional for sit-on-hands)" />
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <FieldHelp fieldId="planEmotion" label="Emotion 1–5" labelClassName="text-[10px] text-indigo-700 uppercase font-bold" />
+                          <input type="range" min={1} max={5} value={planEmotion} onChange={(e) => setPlanEmotion(Number(e.target.value))} className="mt-2 w-full" />
+                          <div className="text-center font-mono text-sm font-bold">{planEmotion}</div>
+                        </div>
+                        <label className="flex items-center gap-2 text-sm mt-4 cursor-pointer">
+                          <input type="checkbox" checked={planNotRevenge} onChange={(e) => setPlanNotRevenge(e.target.checked)} />
+                          <span className="flex items-center gap-1">Not revenge <HelpIcon fieldId="planNotRevenge" /></span>
+                        </label>
+                      </div>
+                      <button type="button" onClick={() => commitTradePlan()} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2.5 rounded-lg text-sm">
+                        Commit trade plan
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => commitTradePlan({ sitOnHands: true })}
+                        className="w-full border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 font-bold py-2.5 rounded-lg text-sm flex items-center justify-center gap-1"
+                      >
+                        Sit on hands — no trade <HelpIcon fieldId="sitOnHands" />
+                      </button>
+                      <p className="text-[10px] text-slate-500 text-center">Sit on hands needs thesis only — no ticker. Not-revenge is optional.</p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="text-sm space-y-1 font-mono bg-white border border-indigo-100 rounded p-3">
+                        {committedPlan?.sitOnHands ? (
+                          <div className="font-bold text-indigo-900">SIT ON HANDS · no_trade</div>
+                        ) : (
+                          <>
+                            <div className="font-bold text-indigo-900">{committedPlan?.ticker} · {committedPlan?.setupGrade} · {committedPlan?.direction}</div>
+                            <div>Entry {committedPlan?.entry} / Stop {committedPlan?.originalStop}</div>
+                          </>
+                        )}
+                        <div className="text-xs text-slate-600 whitespace-pre-wrap">{committedPlan?.thesis}</div>
+                        {!committedPlan?.sitOnHands && (
+                          <div className="text-xs text-slate-500 whitespace-pre-wrap">Invalidation: {committedPlan?.invalidation}</div>
+                        )}
+                        <div className="text-[10px] text-slate-400">Emotion {committedPlan?.emotion} · locked {committedPlan?.committedAt ? new Date(committedPlan.committedAt).toLocaleString() : ''}</div>
+                      </div>
+                      <p className="text-[11px] text-indigo-800">
+                        {committedPlan?.sitOnHands
+                          ? 'No new risk today. Void only if you change your mind and want a trade plan.'
+                          : 'Stop may only tighten. Void to change ticker/entry/thesis.'}
+                      </p>
+                      <button type="button" onClick={voidTradePlan} className="w-full border border-red-300 text-red-700 font-bold py-2 rounded-lg text-sm hover:bg-red-50 flex items-center justify-center gap-1">
+                        Void plan <HelpIcon fieldId="planVoid" />
+                      </button>
+                    </>
+                  )}
                 </div>
 
-                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-                  <h2 className="text-sm font-bold mb-3">Daily journal</h2>
-                  <input type="date" value={journalDate} onChange={(e) => setJournalDate(e.target.value)} className="w-full mb-2 p-1.5 text-xs border rounded bg-slate-50 font-mono" />
-                  <select value={executionType} onChange={(e) => setExecutionType(e.target.value)} className="w-full mb-2 p-1.5 text-xs border rounded bg-slate-50">
-                    <option value="perfect">Perfect Plan Followed</option>
-                    <option value="mistake">Execution Mistake Made</option>
-                  </select>
-                  {executionType === 'mistake' && (
-                    <div className="bg-red-50 p-2 rounded border border-red-200 mb-2 space-y-1">
-                      <select value={mistakeCategory} onChange={(e) => setMistakeType(e.target.value)} className="w-full p-1 text-[11px] border border-red-300 rounded">
-                        <option value="none">Classification...</option>
-                        <option value="fomo">FOMO</option>
-                        <option value="chasing">Chasing</option>
-                        <option value="stop_down">Moved SL down</option>
-                        <option value="oversized">Oversized</option>
-                        <option value="early_exit">Early exit</option>
-                      </select>
-                      <input type="number" step="0.5" value={mistakeCostR} onChange={(e) => setMistakeCostR(Number(e.target.value))} placeholder="Cost R" className="w-full p-1 text-[11px] border border-red-300 rounded font-mono" />
-                      <input type="text" placeholder="1. Why?" value={fiveWs.w1} onChange={e => setFiveWs({...fiveWs, w1: e.target.value})} className="w-full p-1 text-[10px] border border-red-200 rounded" />
-                      <input type="text" placeholder="Solution" value={fiveWs.solution} onChange={e => setFiveWs({...fiveWs, solution: e.target.value})} className="w-full p-1 text-[10px] border border-emerald-300 bg-emerald-50 rounded" />
-                    </div>
-                  )}
-                  <textarea
-                    className="w-full h-20 p-2 text-xs border rounded bg-slate-50"
-                    placeholder="Session notes..."
-                    value={dailyNotes}
-                    onChange={(e) => setDailyNotes(e.target.value)}
-                  />
-                  <button onClick={archiveDay} className="mt-3 w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-2.5 rounded-lg text-sm flex justify-center items-center gap-2">
-                    <Save className="h-4 w-4" />
-                    Save Day & Reset
-                  </button>
+                <div className="bg-white p-4 rounded-xl border border-slate-200">
+                  <h3 className="text-sm font-bold mb-2 flex items-center gap-1">Watchlist <HelpIcon fieldId="watchlist" /></h3>
+                  <div className="flex gap-2 mb-2">
+                    <input type="text" value={watchNote} onChange={(e) => setWatchNote(e.target.value)} placeholder="Note" className="flex-1 p-1.5 text-xs border rounded bg-slate-50" />
+                    <button type="button" onClick={addToWatchlist} className="px-3 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded">Save</button>
+                  </div>
+                  <ul className="space-y-1 max-h-28 overflow-y-auto thin-scrollbar">
+                    {watchlist.map((w) => (
+                      <li key={w.id} className="flex justify-between text-xs border-b border-slate-100 py-1">
+                        <button type="button" onClick={() => loadTickerIntoPlanner(w)} className="font-mono font-bold text-indigo-700">{w.ticker}</button>
+                        <button type="button" onClick={() => removeFromWatchlist(w.id)} className="text-slate-400 hover:text-red-600"><Trash2 className="h-3.5 w-3.5" /></button>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* --- TAB 3: ARCHIVE & BACKUP --- */}
+        {/* --- TAB 3: EXECUTE --- */}
+        {activeTab === 'execute' && (
+          <div className="space-y-4">
+            <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-700 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-wider text-slate-400 font-bold">Step 3 — Execute</div>
+                <p className="text-sm text-slate-300 mt-1">Switch to Live only in your windows. Alerts on. Size is from the locked plan.</p>
+              </div>
+              <button type="button" onClick={() => setActiveTab('archive')} className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-lg">
+                Close day →
+              </button>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase text-slate-400 font-bold flex items-center gap-1">Workspace <HelpIcon fieldId="workspaceMode" /></div>
+                <p className="text-sm text-slate-600 mt-0.5">
+                  {workspaceMode === 'planning' ? 'Planning — hours ignored for sizing checks.' : 'Live — windows + process enforced.'}
+                </p>
+              </div>
+              <div className="flex rounded-lg overflow-hidden border border-slate-300">
+                <button type="button" onClick={() => setWorkspaceMode('planning')} className={`px-4 py-2 text-sm font-bold ${workspaceMode === 'planning' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600'}`}>Planning</button>
+                <button type="button" onClick={() => setWorkspaceMode('live')} className={`px-4 py-2 text-sm font-bold ${workspaceMode === 'live' ? 'bg-emerald-600 text-white' : 'bg-white text-slate-600'}`}>Live</button>
+              </div>
+            </div>
+
+            {discipline.reason && (
+              <div className="p-3 rounded-lg border border-amber-200 bg-amber-50 text-sm text-amber-900 font-semibold flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span className="flex items-center gap-1">{discipline.reason} <HelpIcon fieldId="disciplineChip" /></span>
+              </div>
+            )}
+
+            <div className={`p-5 rounded-xl border ${planOrLiveReady ? 'bg-emerald-50 border-emerald-300' : 'bg-red-50 border-red-300'}`}>
+              <h2 className="text-base font-bold mb-2 flex items-center gap-2">
+                <Clock className={`h-5 w-5 ${planOrLiveReady ? 'text-emerald-700' : 'text-red-700'}`} />
+                {workspaceMode === 'planning' ? 'Plan gate' : 'Live gate'}
+                <HelpIcon fieldId="gateStatus" />
+              </h2>
+              <div className={`text-2xl font-black mb-2 ${planOrLiveReady ? 'text-emerald-700' : 'text-red-700'}`}>
+                {workspaceMode === 'planning'
+                  ? (gate.planningReady ? 'PLAN READY' : 'PLAN BLOCKED')
+                  : (gate.allowed ? 'TRADING ALLOWED' : 'TRADING BLOCKED')}
+              </div>
+              <div className="text-xs font-semibold text-slate-600 mb-2">
+                {workspaceMode} · {gate.phase} · IDT {gate.israelTimeLabel} · shares {planOrLiveReady ? positionSize.shares : 0} · risk $${gate.allowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </div>
+              {gate.reasons.length > 0 && (
+                <ul className="space-y-1">
+                  {gate.reasons.map((reason) => (
+                    <li key={reason} className="text-xs text-red-800 flex gap-1.5">
+                      <Ban className="h-3.5 w-3.5 shrink-0 mt-0.5" />{reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {gate.warnings?.map((w) => (
+                <p key={w} className="text-[11px] text-amber-800 mt-1 font-semibold">{w}</p>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-3">
+                <h3 className="text-sm font-bold">Prep checks</h3>
+                <div className="text-sm text-slate-600">Plan locked: {planCommitted ? '✓' : '○ (step 2)'}</div>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <div onClick={() => toggleRoutine('alerts')} className="text-blue-500">{routine.alerts ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4 text-slate-300" />}</div>
+                  <span className="flex items-center gap-1">Alerts set <HelpIcon fieldId="routineAlerts" /></span>
+                </label>
+                <label className={`flex items-center gap-2 ${!gate.allowed ? 'opacity-50' : 'cursor-pointer'}`}>
+                  <div onClick={() => { if (gate.allowed) toggleRoutine('orders'); }} className="text-orange-500">{routine.orders ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4 text-slate-300" />}</div>
+                  <span>Brackets entered {gate.allowed ? '' : '(Live only)'}</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer pt-2 border-t">
+                  <input type="checkbox" checked={noTradeToday} onChange={(e) => setNoTradeToday(e.target.checked)} />
+                  <span className="flex items-center gap-1 text-sm">No trade today <HelpIcon fieldId="noTradeToday" /></span>
+                </label>
+              </div>
+              <div className="bg-white p-5 rounded-xl border border-slate-200">
+                <h3 className="text-sm font-bold mb-2">Locked plan summary</h3>
+                {!planCommitted ? (
+                  <p className="text-xs text-slate-500">Commit a plan in step 2 first.</p>
+                ) : committedPlan?.sitOnHands ? (
+                  <div className="text-sm font-mono space-y-1">
+                    <div className="font-bold text-slate-800">Sit on hands — no new risk</div>
+                    <div className="text-xs text-slate-600">{committedPlan?.thesis}</div>
+                  </div>
+                ) : (
+                  <div className="text-sm font-mono space-y-1">
+                    <div className="font-bold">{committedPlan?.ticker} {committedPlan?.direction} grade {committedPlan?.setupGrade}</div>
+                    <div>{committedPlan?.entry} → stop {committedPlan?.originalStop}</div>
+                    <div className="text-xs text-slate-600">{committedPlan?.thesis}</div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* --- TAB 4: CLOSE DAY --- */}
         {activeTab === 'archive' && (
           <div className="space-y-6">
-            
-            <div className="bg-slate-800 text-white p-6 rounded-xl shadow-sm border border-slate-700">
+            <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-700">
+              <div className="text-xs uppercase tracking-wider text-slate-400 font-bold">Step 4 — Close day</div>
+              <p className="text-sm text-slate-300 mt-1">Write the truth, archive, auto-download backup for your other PC.</p>
+            </div>
+
+            {backupOverdue && (
+              <div className="p-3 rounded-lg border border-amber-300 bg-amber-50 text-sm text-amber-900 font-semibold flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span className="flex items-center gap-1">Backup overdue — Export or Archive to download JSON for your other PC. <HelpIcon fieldId="backupExport" /></span>
+              </div>
+            )}
+
+            <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-3">
+              <h2 className="text-base font-bold flex items-center gap-2"><Save className="h-5 w-5 text-slate-700" /> Close today</h2>
+              <input type="date" value={journalDate} onChange={(e) => setJournalDate(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50 font-mono" />
+              <select value={executionType} onChange={(e) => setExecutionType(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50">
+                <option value="perfect">Perfect plan followed</option>
+                <option value="mistake">Execution mistake</option>
+              </select>
+              {executionType === 'mistake' && (
+                <div className="bg-red-50 p-3 rounded border border-red-200 space-y-2">
+                  <select value={mistakeCategory} onChange={(e) => setMistakeType(e.target.value)} className="w-full p-1.5 text-sm border border-red-300 rounded">
+                    <option value="none">Classification...</option>
+                    <option value="fomo">FOMO</option>
+                    <option value="chasing">Chasing / revenge</option>
+                    <option value="stop_down">Moved SL</option>
+                    <option value="oversized">Oversized</option>
+                    <option value="early_exit">Early exit</option>
+                  </select>
+                  <input type="number" step="0.5" value={mistakeCostR} onChange={(e) => setMistakeCostR(Number(e.target.value))} placeholder="Cost in R" className="w-full p-1.5 text-sm border border-red-300 rounded font-mono" />
+                  {['w1', 'w2', 'w3', 'w4', 'w5'].map((k, i) => (
+                    <input key={k} type="text" placeholder={`${i + 1}. Why?`} value={fiveWs[k]} onChange={(e) => setFiveWs({ ...fiveWs, [k]: e.target.value })} className="w-full p-1.5 text-xs border border-red-200 rounded" />
+                  ))}
+                  <input type="text" placeholder="Solution" value={fiveWs.solution} onChange={(e) => setFiveWs({ ...fiveWs, solution: e.target.value })} className="w-full p-1.5 text-xs border border-emerald-300 bg-emerald-50 rounded" />
+                </div>
+              )}
+              <textarea
+                className="w-full h-24 p-2 text-sm border rounded bg-slate-50"
+                placeholder="Session notes (min ~20 chars)..."
+                value={dailyNotes}
+                onChange={(e) => setDailyNotes(e.target.value)}
+              />
+              <button type="button" onClick={archiveDay} className="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-2.5 rounded-lg text-sm flex justify-center items-center gap-2">
+                <Save className="h-4 w-4" />
+                Archive day + download backup
+              </button>
+            </div>
+
+            <div className="bg-slate-800 text-white p-5 rounded-xl shadow-sm border border-slate-700">
               <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                 <div>
-                  <h3 className="text-lg font-bold flex items-center gap-2">
-                    <Save className="text-blue-400 h-5 w-5" />
-                    Database Local Backup Utility
+                  <h3 className="text-base font-bold flex items-center gap-2">
+                    <Download className="text-blue-400 h-5 w-5" />
+                    File transfer backup
+                    <HelpIcon fieldId="backupExport" />
                   </h3>
                   <p className="text-slate-400 text-xs mt-1">
-                    Your entire journal is saved automatically in your browser's memory. Export regular backups to prevent loss.
+                    Last backup: {lastBackupAt ? new Date(lastBackupAt).toLocaleString() : 'never'} · Import on work PC / home laptop.
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <button 
-                    onClick={exportDatabase}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs py-2.5 px-4 rounded-lg flex items-center gap-1.5 shadow transition-colors"
+                  <button
+                    type="button"
+                    onClick={() => exportDatabase()}
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs py-2.5 px-4 rounded-lg flex items-center gap-1.5"
                   >
                     <Download className="h-4 w-4" />
-                    Export Backup (.json)
+                    Export (.json)
                   </button>
-                  <label className="cursor-pointer bg-slate-700 hover:bg-slate-600 text-white font-semibold text-xs py-2.5 px-4 rounded-lg flex items-center gap-1.5 shadow transition-colors">
+                  <label className="cursor-pointer bg-slate-700 hover:bg-slate-600 text-white font-semibold text-xs py-2.5 px-4 rounded-lg flex items-center gap-1.5">
                     <Upload className="h-4 w-4" />
-                    Restore Backup
+                    Import
                     <input type="file" accept=".json" onChange={importDatabase} className="hidden" />
                   </label>
                 </div>
