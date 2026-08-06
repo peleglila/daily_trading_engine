@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   ShieldAlert, CheckCircle, AlertTriangle, TrendingDown, 
   Activity, CheckSquare, Square, Calendar, BookOpen, 
@@ -15,7 +15,16 @@ import { DEFAULT_SCHEDULE, getTradingGate } from './src/engine/tradingGate';
 import { emptySnapshot, parseIbkrPortfolioText } from './src/engine/ibkrOcrParser';
 import { computePortfolioRiskScore } from './src/engine/portfolioRiskScore';
 import { computeDisciplinePenalty } from './src/engine/disciplinePenalty';
+import {
+  calculateRiskMetrics,
+  complianceFromHistory,
+  createLockoutExpiration,
+  isLockoutActive,
+} from './src/engine/riskEngine';
+import { RISK_GUARDRAILS } from './src/types/trading';
 import { FieldHelp, HelpIcon } from './src/ui/FieldHelp';
+import { RiskHeaderBar } from './src/ui/RiskHeaderBar';
+import { PreFlightSizerModal } from './src/ui/PreFlightSizerModal';
 
 const todayISO = () => new Date().toISOString().split('T')[0];
 
@@ -54,6 +63,8 @@ export default function App() {
   const [ocrProgress, setOcrProgress] = useState(0);
   const [ocrError, setOcrError] = useState('');
   const [ocrDraft, setOcrDraft] = useState(null); // editable review snapshot
+  const [ocrDragActive, setOcrDragActive] = useState(false);
+  const ocrFileInputRef = useRef(null);
 
   // Mistake & Process Tracking State (SMB Capital 5 W's Model)
   const [executionType, setExecutionType] = useState('perfect'); // 'perfect' or 'mistake'
@@ -107,6 +118,16 @@ export default function App() {
   const [lastBackupAt, setLastBackupAt] = useState(null);
   const [noTradeToday, setNoTradeToday] = useState(false);
 
+  // Risk Enforcement Shield (spec v2)
+  const [tradeCompliance, setTradeCompliance] = useState([]); // rolling trade EIS log
+  const [lockoutExpirationTimestamp, setLockoutExpirationTimestamp] = useState(null);
+  const [preFlightOpen, setPreFlightOpen] = useState(false);
+  const [preFlightLogged, setPreFlightLogged] = useState(false);
+  const [hasLiveBracketOrder, setHasLiveBracketOrder] = useState(false);
+  // Post-market accountability audit (spec §5.3)
+  const [auditCompliantSetup, setAuditCompliantSetup] = useState(null); // true | false | null
+  const [auditStopTampered, setAuditStopTampered] = useState(null); // true | false | null
+
   // Archive History
   const [history, setHistory] = useState([]);
 
@@ -120,9 +141,19 @@ export default function App() {
     const savedQqq = localStorage.getItem('pelegQqqStatus');
     const savedSpy = localStorage.getItem('pelegSpyStatus');
     const savedGate = localStorage.getItem('pelegTradeGateConfig');
+    const savedCompliance = localStorage.getItem('pelegTradeCompliance');
+    const savedLockout = localStorage.getItem('pelegLockoutExpiration');
 
     if (savedHistory) {
       try { setHistory(JSON.parse(savedHistory)); } catch (e) { console.error('Failed to parse history'); }
+    }
+    if (savedCompliance) {
+      try { setTradeCompliance(JSON.parse(savedCompliance)); } catch (e) { console.error('Failed to parse trade compliance'); }
+    }
+    if (savedLockout) {
+      const ts = Number(savedLockout);
+      if (Number.isFinite(ts) && isLockoutActive(ts)) setLockoutExpirationTimestamp(ts);
+      else localStorage.removeItem('pelegLockoutExpiration');
     }
     if (savedPeak) setPeakEquity(Number(savedPeak));
     if (savedCurrent) setCurrentEquity(Number(savedCurrent));
@@ -176,6 +207,13 @@ export default function App() {
         if (g.lastArchivedDate) setLastArchivedDate(g.lastArchivedDate);
         if (g.lastBackupAt) setLastBackupAt(g.lastBackupAt);
         if (g.noTradeToday != null) setNoTradeToday(!!g.noTradeToday);
+        if (Array.isArray(g.tradeCompliance)) setTradeCompliance(g.tradeCompliance);
+        if (g.lockoutExpirationTimestamp != null) {
+          const ts = Number(g.lockoutExpirationTimestamp);
+          if (Number.isFinite(ts) && isLockoutActive(ts)) setLockoutExpirationTimestamp(ts);
+        }
+        if (g.preFlightLogged != null) setPreFlightLogged(!!g.preFlightLogged);
+        if (g.hasLiveBracketOrder != null) setHasLiveBracketOrder(!!g.hasLiveBracketOrder);
       } catch (e) {
         console.error('Failed to parse trade gate config');
       }
@@ -240,6 +278,10 @@ export default function App() {
       lastArchivedDate,
       lastBackupAt,
       noTradeToday,
+      tradeCompliance,
+      lockoutExpirationTimestamp,
+      preFlightLogged,
+      hasLiveBracketOrder,
     };
     localStorage.setItem('pelegTradeGateConfig', JSON.stringify(gateConfig));
   }, [
@@ -251,7 +293,23 @@ export default function App() {
     positions, snapshotImportedAt, routine, unrealizedOpenRisk, dailyRealizedPL,
     planCommitted, committedPlan, planThesis, planInvalidation, planEmotion, planNotRevenge,
     sessionTraded, sessionTradeDate, lastArchivedDate, lastBackupAt, noTradeToday,
+    tradeCompliance, lockoutExpirationTimestamp, preFlightLogged, hasLiveBracketOrder,
   ]);
+
+  useEffect(() => {
+    localStorage.setItem('pelegTradeCompliance', JSON.stringify(tradeCompliance));
+  }, [tradeCompliance]);
+
+  useEffect(() => {
+    if (lockoutExpirationTimestamp != null && isLockoutActive(lockoutExpirationTimestamp)) {
+      localStorage.setItem('pelegLockoutExpiration', String(lockoutExpirationTimestamp));
+    } else {
+      localStorage.removeItem('pelegLockoutExpiration');
+      if (lockoutExpirationTimestamp != null && !isLockoutActive(lockoutExpirationTimestamp)) {
+        setLockoutExpirationTimestamp(null);
+      }
+    }
+  }, [lockoutExpirationTimestamp]);
 
   // Refresh clock for live gate status
   useEffect(() => {
@@ -322,6 +380,17 @@ export default function App() {
 
   const sitOnHandsPlan = !!(planCommitted && committedPlan?.sitOnHands);
 
+  const eisSource =
+    tradeCompliance.length > 0 ? tradeCompliance : complianceFromHistory(history);
+
+  const globalRisk = calculateRiskMetrics(positions, currentEquity, {
+    tradeCompliance: eisSource,
+    lockoutExpirationTimestamp,
+    nowMs: nowTick.getTime(),
+  });
+
+  const lockoutActive = globalRisk.isLockoutActive;
+
   const gate = getTradingGate({
     now: nowTick,
     schedule: tradingSchedule,
@@ -337,6 +406,10 @@ export default function App() {
     sitOnHands: sitOnHandsPlan,
     needsPriorClose,
     discipline,
+    isLockoutActive: lockoutActive,
+    lockoutExpirationTimestamp,
+    portfolioHeatOverCap: globalRisk.heatOverCap,
+    portfolioHeatPercent: globalRisk.totalPortfolioHeatPercent,
   });
 
   const portfolioScore = computePortfolioRiskScore({
@@ -352,15 +425,32 @@ export default function App() {
     positions,
   });
 
-  // Keep open exposure in true R units (not raw unrealized $)
+  // Prefer stop-based open heat (spec §3.2) when stops are tagged; else unrealized proxy
   useEffect(() => {
-    setUnrealizedOpenRisk(portfolioScore.openRiskEstimateR);
-  }, [portfolioScore.openRiskEstimateR]);
+    const heatR =
+      oneRValue > 0
+        ? (globalRisk.totalPortfolioHeatPercent / 100) * currentEquity / oneRValue
+        : 0;
+    const hasStopData = positions.some(
+      (p) => Number(p.activeStopPrice || p.initialStopPrice) > 0 && Number(p.entryPrice) > 0
+    );
+    setUnrealizedOpenRisk(hasStopData ? Math.round(heatR * 10) / 10 : portfolioScore.openRiskEstimateR);
+  }, [
+    globalRisk.totalPortfolioHeatPercent,
+    currentEquity,
+    oneRValue,
+    positions,
+    portfolioScore.openRiskEstimateR,
+  ]);
+
+  // GR-01 hard-caps process risk at 0.50% of equity
+  const hardCapRiskDollars = currentEquity * (RISK_GUARDRAILS.maxRiskPerTradePct / 100);
+  const effectiveAllowedRisk = Math.min(gate.allowedRisk, hardCapRiskDollars);
 
   const positionSize = computePositionSize({
     entryPrice,
     stopPrice,
-    allowedRisk: gate.allowedRisk,
+    allowedRisk: effectiveAllowedRisk,
     direction: tradeDirection,
     requestedShares: requestedShares > 0 ? requestedShares : undefined,
   });
@@ -448,6 +538,10 @@ export default function App() {
       return;
     }
 
+    if (lockoutActive) {
+      alert('GR-06 lockout active — new trade plans are disabled for 48 hours after stop-tamper.');
+      return;
+    }
     if (!tradeTicker.trim()) {
       alert('Enter a ticker before committing — or use “Sit on hands”.');
       return;
@@ -456,8 +550,17 @@ export default function App() {
       alert('Entry and stop are required to commit a trade plan.');
       return;
     }
+    if (!preFlightLogged || !hasLiveBracketOrder) {
+      alert('Complete Pre-Flight Order Sizer and confirm the live IBKR bracket (GR-05) before Commit.');
+      setPreFlightOpen(true);
+      return;
+    }
     if (setupCapBlocked) {
       alert(`Setup grade exceeds cap (${effectiveSetupCap}). Lower the grade first.`);
+      return;
+    }
+    if (globalRisk.heatOverCap) {
+      alert('GR-03 portfolio heat is over 2% — no new entries until heat drops.');
       return;
     }
     const orig = stopPrice;
@@ -488,6 +591,22 @@ export default function App() {
     setCommittedPlan(null);
     setRoutine((prev) => ({ ...prev, journal: false }));
     setNoTradeToday(false);
+    setPreFlightLogged(false);
+    setHasLiveBracketOrder(false);
+  };
+
+  const handlePreFlightLogTrade = (payload) => {
+    // Seed planner only — do not inflate open heat until the position is real in IBKR snapshot
+    setTradeTicker(payload.ticker);
+    setEntryPrice(payload.entryPrice);
+    setStopPrice(payload.stopPrice);
+    setOriginalStop(payload.stopPrice);
+    setTradeDirection(payload.direction);
+    setRequestedShares(payload.maxShares);
+    setHasLiveBracketOrder(true);
+    setPreFlightLogged(true);
+    setPreFlightOpen(false);
+    alert(`Pre-flight logged: ${payload.ticker} × ${payload.maxShares} shares ($${payload.dollarRisk.toFixed(0)} risk). Confirm thesis and Commit.`);
   };
 
   const loadTickerIntoPlanner = (item) => {
@@ -513,6 +632,24 @@ export default function App() {
 
   const removeFromWatchlist = (id) => {
     setWatchlist((prev) => prev.filter((w) => w.id !== id));
+  };
+
+  const pickImageFile = (fileList) => {
+    const files = Array.from(fileList || []);
+    return files.find((f) => f && (f.type?.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name))) || null;
+  };
+
+  const handleOcrDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setOcrDragActive(false);
+    if (ocrBusy) return;
+    const file = pickImageFile(e.dataTransfer?.files);
+    if (!file) {
+      setOcrError('Drop an image file (PNG/JPG) of the IBKR Portfolio screenshot.');
+      return;
+    }
+    runOcrOnFile(file);
   };
 
   const runOcrOnFile = async (file) => {
@@ -619,7 +756,43 @@ export default function App() {
       alert('Select execution type (perfect or mistake).');
       return;
     }
+    // Spec §5.3 — mandatory accountability audit when a trade was attempted
+    if (sessionTraded || (planCommitted && !committedPlan?.sitOnHands)) {
+      if (auditCompliantSetup == null || auditStopTampered == null) {
+        alert('Complete the Post-Market Accountability Audit (both YES/NO questions) before archiving.');
+        return;
+      }
+    }
     if (!window.confirm("Archive today's data, download backup, and reset checklists?")) return;
+
+    // GR-06: stop-tamper from audit Q2 or stop_down mistake category
+    const stopTamper =
+      auditStopTampered === true ||
+      (executionType === 'mistake' && mistakeCategory === 'stop_down');
+    if (stopTamper) {
+      const until = createLockoutExpiration();
+      setLockoutExpirationTimestamp(until);
+    }
+
+    // EIS: record compliance from audit + execution type
+    const dayCompliant =
+      executionType === 'perfect' &&
+      auditStopTampered !== true &&
+      auditCompliantSetup !== false;
+    setTradeCompliance((prev) => [
+      {
+        id: Date.now(),
+        ticker: tradeTicker || committedPlan?.ticker || 'SESSION',
+        compliant: dayCompliant,
+        timestamp: Date.now(),
+        reason: stopTamper
+          ? 'GR-06 stop-tamper — 48h lockout'
+          : dayCompliant
+            ? 'Compliant close'
+            : 'Non-compliant close / audit',
+      },
+      ...prev,
+    ].slice(0, RISK_GUARDRAILS.eisWindowTrades));
 
     const [y, m, d] = journalDate.split('-');
     const displayDate = `${d}/${m}/${y}`;
@@ -655,6 +828,11 @@ export default function App() {
       allowedRisk: gate.allowedRisk,
       calculatedShares: positionSize.shares,
       committedPlan,
+      portfolioHeat: globalRisk.totalPortfolioHeatPercent,
+      executionIntegrityScore: globalRisk.executionIntegrityScore,
+      auditCompliantSetup,
+      auditStopTampered,
+      hasLiveBracketOrder,
     };
 
     const nextHistory = [newEntry, ...history];
@@ -691,6 +869,10 @@ export default function App() {
     setPlanNotRevenge(false);
     setPlanEmotion(3);
     setWorkspaceMode('planning');
+    setPreFlightLogged(false);
+    setHasLiveBracketOrder(false);
+    setAuditCompliantSetup(null);
+    setAuditStopTampered(null);
 
     const backupAt = new Date().toISOString();
     setLastBackupAt(backupAt);
@@ -773,6 +955,10 @@ export default function App() {
         lastArchivedDate: archived,
         lastBackupAt: backupAt,
         noTradeToday,
+        tradeCompliance,
+        lockoutExpirationTimestamp,
+        preFlightLogged,
+        hasLiveBracketOrder,
       },
     };
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData));
@@ -827,6 +1013,13 @@ export default function App() {
     if (g.lastArchivedDate !== undefined) setLastArchivedDate(g.lastArchivedDate);
     if (g.lastBackupAt !== undefined) setLastBackupAt(g.lastBackupAt);
     if (g.noTradeToday != null) setNoTradeToday(!!g.noTradeToday);
+    if (Array.isArray(g.tradeCompliance)) setTradeCompliance(g.tradeCompliance);
+    if (g.lockoutExpirationTimestamp != null) {
+      const ts = Number(g.lockoutExpirationTimestamp);
+      if (Number.isFinite(ts)) setLockoutExpirationTimestamp(ts);
+    }
+    if (g.preFlightLogged != null) setPreFlightLogged(!!g.preFlightLogged);
+    if (g.hasLiveBracketOrder != null) setHasLiveBracketOrder(!!g.hasLiveBracketOrder);
   };
 
   const importDatabase = (e) => {
@@ -866,8 +1059,29 @@ export default function App() {
     </div>
   );
 
+  const lockoutLabel = lockoutActive && lockoutExpirationTimestamp
+    ? `until ${new Date(lockoutExpirationTimestamp).toLocaleString()}`
+    : '';
+
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 pb-10">
+      <RiskHeaderBar metrics={globalRisk} lockoutLabel={lockoutLabel} />
+
+      <PreFlightSizerModal
+        open={preFlightOpen}
+        onClose={() => setPreFlightOpen(false)}
+        totalEquity={currentEquity}
+        processAllowedRisk={effectiveAllowedRisk > 0 ? effectiveAllowedRisk : hardCapRiskDollars}
+        currentPortfolioHeatPercent={globalRisk.totalPortfolioHeatPercent}
+        initial={{
+          ticker: tradeTicker,
+          entryPrice,
+          stopPrice,
+          direction: tradeDirection,
+          hasLiveBracketOrder,
+        }}
+        onLogTrade={handlePreFlightLogTrade}
+      />
       
       {/* --- TOP NAVIGATION --- */}
       <div className="bg-slate-900 text-white px-4 md:px-8 pt-6 pb-0 shadow-lg">
@@ -996,16 +1210,60 @@ export default function App() {
                   </span>
                 )}
               </div>
-              <label className="flex flex-col items-center justify-center border-2 border-dashed border-indigo-200 rounded-lg p-6 cursor-pointer hover:bg-indigo-50/50">
-                <span className="text-sm font-semibold text-indigo-800">Drop or click to upload screenshot</span>
+              <div
+                role="button"
+                tabIndex={0}
+                className={`flex flex-col items-center justify-center border-2 border-dashed rounded-lg p-6 transition-colors ${
+                  ocrDragActive
+                    ? 'border-indigo-500 bg-indigo-100'
+                    : 'border-indigo-200 hover:bg-indigo-50/50'
+                } ${ocrBusy ? 'opacity-60 pointer-events-none' : 'cursor-pointer'}`}
+                onClick={() => {
+                  if (!ocrBusy) ocrFileInputRef.current?.click();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    if (!ocrBusy) ocrFileInputRef.current?.click();
+                  }
+                }}
+                onDragEnter={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!ocrBusy) setOcrDragActive(true);
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+                  if (!ocrBusy) setOcrDragActive(true);
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
+                  setOcrDragActive(false);
+                }}
+                onDrop={handleOcrDrop}
+              >
+                <span className="text-sm font-semibold text-indigo-800">
+                  {ocrDragActive ? 'Drop screenshot here' : 'Drop or click to upload screenshot'}
+                </span>
                 <span className="text-[11px] text-slate-500 mt-1">IBKR mobile Portfolio tab</span>
                 <input
+                  ref={ocrFileInputRef}
                   type="file"
                   accept="image/*"
                   className="hidden"
-                  onChange={(e) => runOcrOnFile(e.target.files?.[0])}
+                  disabled={ocrBusy}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => {
+                    const file = pickImageFile(e.target.files);
+                    if (file) runOcrOnFile(file);
+                    e.target.value = '';
+                  }}
                 />
-              </label>
+              </div>
               {ocrBusy && (
                 <div className="mt-3 text-xs font-mono text-indigo-700">OCR progress: {ocrProgress}%</div>
               )}
@@ -1042,20 +1300,12 @@ export default function App() {
                     ))}
                   </div>
                   <div>
-                    <FieldHelp fieldId="positions" label="Positions" labelClassName="text-[10px] font-bold text-slate-400 uppercase" />
-                    <div className="mt-2 hidden md:grid md:grid-cols-6 gap-1 text-[9px] font-bold text-slate-400 uppercase px-0.5">
-                      <span className="flex items-center gap-0.5">Ticker <HelpIcon fieldId="posTicker" /></span>
-                      <span className="flex items-center gap-0.5">Qty <HelpIcon fieldId="posQty" /></span>
-                      <span className="flex items-center gap-0.5">Last <HelpIcon fieldId="posLast" /></span>
-                      <span className="flex items-center gap-0.5">P&L <HelpIcon fieldId="posPnl" /></span>
-                      <span className="flex items-center gap-0.5">Entry $ <HelpIcon fieldId="posEntryPrice" /></span>
-                      <span className="flex items-center gap-0.5">Entry date <HelpIcon fieldId="posEntryDate" /></span>
-                    </div>
-                    <div className="mt-1 space-y-2">
+                    <FieldHelp fieldId="positions" label="Positions (+ stops for heat)" labelClassName="text-[10px] font-bold text-slate-400 uppercase" />
+                    <div className="mt-2 space-y-2">
                       {(ocrDraft.positions || []).map((p, idx) => (
-                        <div key={`${p.ticker || 'row'}-${idx}`} className="grid grid-cols-2 md:grid-cols-6 gap-1 text-xs bg-slate-50 border border-slate-100 rounded p-1.5">
+                        <div key={`${p.ticker || 'row'}-${idx}`} className="grid grid-cols-2 md:grid-cols-4 gap-1 text-xs bg-slate-50 border border-slate-100 rounded p-1.5">
                           <div>
-                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Ticker <HelpIcon fieldId="posTicker" /></span>
+                            <span className="text-[9px] text-slate-400 uppercase">Ticker</span>
                             <input className="w-full border rounded p-1 font-mono" value={p.ticker} onChange={(e) => {
                               const positionsNext = [...ocrDraft.positions];
                               positionsNext[idx] = { ...p, ticker: e.target.value.toUpperCase() };
@@ -1063,7 +1313,7 @@ export default function App() {
                             }} placeholder="TICKER" />
                           </div>
                           <div>
-                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Qty <HelpIcon fieldId="posQty" /></span>
+                            <span className="text-[9px] text-slate-400 uppercase">Qty</span>
                             <input type="number" className="w-full border rounded p-1 font-mono" value={p.qty || ''} onChange={(e) => {
                               const positionsNext = [...ocrDraft.positions];
                               positionsNext[idx] = { ...p, qty: Number(e.target.value) };
@@ -1071,7 +1321,7 @@ export default function App() {
                             }} placeholder="qty" />
                           </div>
                           <div>
-                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Last <HelpIcon fieldId="posLast" /></span>
+                            <span className="text-[9px] text-slate-400 uppercase">Last</span>
                             <input type="number" step="0.01" className="w-full border rounded p-1 font-mono" value={p.last ?? ''} onChange={(e) => {
                               const positionsNext = [...ocrDraft.positions];
                               positionsNext[idx] = { ...p, last: Number(e.target.value) };
@@ -1079,7 +1329,7 @@ export default function App() {
                             }} placeholder="last" />
                           </div>
                           <div>
-                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">P&L <HelpIcon fieldId="posPnl" /></span>
+                            <span className="text-[9px] text-slate-400 uppercase">P&L</span>
                             <input type="number" className="w-full border rounded p-1 font-mono" value={p.pnl ?? ''} onChange={(e) => {
                               const positionsNext = [...ocrDraft.positions];
                               positionsNext[idx] = { ...p, pnl: Number(e.target.value) };
@@ -1087,7 +1337,7 @@ export default function App() {
                             }} placeholder="pnl" />
                           </div>
                           <div>
-                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Entry $ <HelpIcon fieldId="posEntryPrice" /></span>
+                            <span className="text-[9px] text-slate-400 uppercase">Entry $</span>
                             <input type="number" step="0.01" className="w-full border rounded p-1 font-mono" value={p.entryPrice ?? ''} onChange={(e) => {
                               const positionsNext = [...ocrDraft.positions];
                               positionsNext[idx] = { ...p, entryPrice: Number(e.target.value) };
@@ -1095,13 +1345,38 @@ export default function App() {
                             }} placeholder="avg entry" />
                           </div>
                           <div>
-                            <span className="md:hidden text-[9px] text-slate-400 uppercase flex items-center gap-0.5">Entry date <HelpIcon fieldId="posEntryDate" /></span>
+                            <span className="text-[9px] text-slate-400 uppercase">Active stop</span>
+                            <input type="number" step="0.01" className="w-full border rounded p-1 font-mono" value={p.activeStopPrice ?? p.initialStopPrice ?? ''} onChange={(e) => {
+                              const v = Number(e.target.value);
+                              const positionsNext = [...ocrDraft.positions];
+                              positionsNext[idx] = {
+                                ...p,
+                                activeStopPrice: v,
+                                initialStopPrice: p.initialStopPrice || v,
+                              };
+                              setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                            }} placeholder="stop" />
+                          </div>
+                          <div>
+                            <span className="text-[9px] text-slate-400 uppercase">Entry date</span>
                             <input type="date" className="w-full border rounded p-1 font-mono" value={p.entryDate || ''} onChange={(e) => {
                               const positionsNext = [...ocrDraft.positions];
                               positionsNext[idx] = { ...p, entryDate: e.target.value };
                               setOcrDraft({ ...ocrDraft, positions: positionsNext });
                             }} />
                           </div>
+                          <label className="col-span-2 md:col-span-4 flex items-center gap-2 text-[11px] text-slate-700 mt-0.5">
+                            <input
+                              type="checkbox"
+                              checked={!!p.hasLiveBracketOrder}
+                              onChange={(e) => {
+                                const positionsNext = [...ocrDraft.positions];
+                                positionsNext[idx] = { ...p, hasLiveBracketOrder: e.target.checked };
+                                setOcrDraft({ ...ocrDraft, positions: positionsNext });
+                              }}
+                            />
+                            Live hard bracket confirmed in IBKR
+                          </label>
                         </div>
                       ))}
                       <button
@@ -1109,7 +1384,15 @@ export default function App() {
                         className="text-[11px] text-indigo-700 font-semibold"
                         onClick={() => setOcrDraft({
                           ...ocrDraft,
-                          positions: [...(ocrDraft.positions || []), { ticker: '', qty: 0, entryPrice: undefined, entryDate: '' }],
+                          positions: [...(ocrDraft.positions || []), {
+                            ticker: '',
+                            qty: 0,
+                            entryPrice: undefined,
+                            entryDate: '',
+                            initialStopPrice: undefined,
+                            activeStopPrice: undefined,
+                            hasLiveBracketOrder: false,
+                          }],
                         })}
                       >
                         + Add position row
@@ -1206,13 +1489,27 @@ export default function App() {
                 </div>
                 {positions.length > 0 && (
                   <div>
-                    <FieldHelp fieldId="positions" label="Positions" labelClassName="text-[10px] text-slate-400 uppercase" />
+                    <FieldHelp fieldId="positions" label="Positions / open risk" labelClassName="text-[10px] text-slate-400 uppercase" />
                     <ul className="mt-1 space-y-2 max-h-36 overflow-y-auto thin-scrollbar">
-                      {positions.map((p) => (
-                        <li key={p.ticker} className="text-[11px] font-mono text-slate-300 border border-slate-700 rounded p-1.5">
-                          <div className="flex justify-between"><span>{p.ticker} × {p.qty}</span><span>{p.pnl != null ? p.pnl.toLocaleString() : '—'}</span></div>
-                        </li>
-                      ))}
+                      {positions.map((p) => {
+                        const openRisk = Math.max(
+                          0,
+                          ((Number(p.entryPrice) || 0) - (Number(p.activeStopPrice || p.initialStopPrice) || 0)) *
+                            Math.abs(Number(p.qty) || 0)
+                        );
+                        return (
+                          <li key={p.ticker} className="text-[11px] font-mono text-slate-300 border border-slate-700 rounded p-1.5">
+                            <div className="flex justify-between">
+                              <span>{p.ticker} × {p.qty}</span>
+                              <span>{p.pnl != null ? p.pnl.toLocaleString() : '—'}</span>
+                            </div>
+                            <div className="flex justify-between text-[10px] text-slate-500 mt-0.5">
+                              <span>open risk</span>
+                              <span>${openRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                            </div>
+                          </li>
+                        );
+                      })}
                     </ul>
                   </div>
                 )}
@@ -1290,9 +1587,34 @@ export default function App() {
                     Position size
                   </h2>
                   <div className="text-xs text-slate-500 mb-3">
-                    1R $${oneRValue.toLocaleString(undefined, { maximumFractionDigits: 0 })} · Setup {gate.setupFactor}x
+                    Hard cap {RISK_GUARDRAILS.maxRiskPerTradePct}% (${hardCapRiskDollars.toLocaleString(undefined, { maximumFractionDigits: 0 })})
+                    · Process $${effectiveAllowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    · Setup {gate.setupFactor}x
                     {discipline.factor < 1 ? ` · Disc ${discipline.factor}x` : ''}
                   </div>
+                  {lockoutActive && (
+                    <div className="mb-3 p-2 rounded border border-red-300 bg-red-50 text-[11px] text-red-800 font-bold">
+                      GR-06 lockout active {lockoutLabel}. New entries blocked.
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    disabled={lockoutActive || planCommitted}
+                    onClick={() => setPreFlightOpen(true)}
+                    className={`mb-3 w-full font-bold py-2.5 rounded-lg text-sm flex items-center justify-center gap-2 ${
+                      lockoutActive || planCommitted
+                        ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                        : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                    }`}
+                  >
+                    <ShieldAlert className="h-4 w-4" />
+                    {preFlightLogged ? 'Re-open Pre-Flight Sizer' : 'Open Pre-Flight Order Sizer'}
+                  </button>
+                  {preFlightLogged && (
+                    <div className="mb-3 text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded p-2">
+                      Pre-flight logged · bracket confirmed · max {requestedShares || positionSize.shares} sh
+                    </div>
+                  )}
                   <div className="grid grid-cols-2 gap-2 mb-3">
                     <div>
                       <FieldHelp fieldId="tradeTicker" label="Ticker" labelClassName="text-[10px] text-slate-400 uppercase font-bold" />
@@ -1340,9 +1662,18 @@ export default function App() {
                       </select>
                     </div>
                   </div>
-                  <div className={`p-3 rounded-lg border text-sm ${positionSize.shares > 0 && gate.allowedRisk > 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className={`p-3 rounded-lg border text-sm ${positionSize.shares > 0 && effectiveAllowedRisk > 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
                     <div className="flex justify-between font-bold"><span>Max shares (preview)</span><span className="font-mono">{positionSize.shares}</span></div>
-                    <div className="flex justify-between text-xs mt-1"><span>Allowed risk</span><span className="font-mono">$${gate.allowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></div>
+                    <div className="flex justify-between text-xs mt-1"><span>Effective risk (min process, 0.5%)</span><span className="font-mono">${effectiveAllowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></div>
+                    {entryPrice > 0 && positionSize.shares > 0 && (
+                      <div className="flex justify-between text-xs mt-1">
+                        <span>Position weight</span>
+                        <span className="font-mono">
+                          {((positionSize.shares * entryPrice / Math.max(currentEquity, 1)) * 100).toFixed(1)}%
+                          {' '}/ {RISK_GUARDRAILS.maxPositionWeightPct}% max
+                        </span>
+                      </div>
+                    )}
                   </div>
                   {tradePlan.reasons.map((r) => (
                     <div key={r} className="mt-2 text-[11px] text-red-700">• {r}</div>
@@ -1529,7 +1860,7 @@ export default function App() {
                   : (gate.allowed ? 'TRADING ALLOWED' : 'TRADING BLOCKED')}
               </div>
               <div className="text-xs font-semibold text-slate-600 mb-2">
-                {workspaceMode} · {gate.phase} · IDT {gate.israelTimeLabel} · shares {planOrLiveReady ? positionSize.shares : 0} · risk $${gate.allowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                {workspaceMode} · {gate.phase} · IDT {gate.israelTimeLabel} · shares {planOrLiveReady ? positionSize.shares : 0} · risk ${effectiveAllowedRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })} · heat {globalRisk.totalPortfolioHeatPercent.toFixed(2)}%
               </div>
               {gate.reasons.length > 0 && (
                 <ul className="space-y-1">
@@ -1600,6 +1931,66 @@ export default function App() {
 
             <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-3">
               <h2 className="text-base font-bold flex items-center gap-2"><Save className="h-5 w-5 text-slate-700" /> Close today</h2>
+
+              {(sessionTraded || (planCommitted && !committedPlan?.sitOnHands)) && (
+                <div className="bg-amber-50 border border-amber-300 rounded-xl p-4 space-y-3">
+                  <h3 className="text-sm font-bold text-amber-950 flex items-center gap-2">
+                    <ShieldAlert className="h-4 w-4" />
+                    Post-Market Accountability Audit
+                  </h3>
+                  <p className="text-[11px] text-amber-900">
+                    Mandatory before archive when a trade was planned/executed. Q2 YES triggers a 48-hour lockout (GR-06).
+                  </p>
+                  <div>
+                    <div className="text-xs font-semibold text-slate-800 mb-1">
+                      1. Did you enter this trade with a fully compliant setup and size?
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAuditCompliantSetup(true)}
+                        className={`px-3 py-1.5 text-xs font-bold rounded border ${auditCompliantSetup === true ? 'bg-emerald-600 text-white border-emerald-700' : 'bg-white text-slate-700 border-slate-300'}`}
+                      >
+                        YES
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAuditCompliantSetup(false)}
+                        className={`px-3 py-1.5 text-xs font-bold rounded border ${auditCompliantSetup === false ? 'bg-red-600 text-white border-red-700' : 'bg-white text-slate-700 border-slate-300'}`}
+                      >
+                        NO
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-slate-800 mb-1">
+                      2. Did you cancel, move down, or widen your stop loss at any point today?
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAuditStopTampered(true)}
+                        className={`px-3 py-1.5 text-xs font-bold rounded border ${auditStopTampered === true ? 'bg-red-600 text-white border-red-700' : 'bg-white text-slate-700 border-slate-300'}`}
+                      >
+                        YES
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAuditStopTampered(false)}
+                        className={`px-3 py-1.5 text-xs font-bold rounded border ${auditStopTampered === false ? 'bg-emerald-600 text-white border-emerald-700' : 'bg-white text-slate-700 border-slate-300'}`}
+                      >
+                        NO
+                      </button>
+                    </div>
+                    {auditStopTampered === true && (
+                      <p className="mt-2 text-[11px] font-bold text-red-700">
+                        Selecting YES will activate a 48-hour system lockout on new entries.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <input type="date" value={journalDate} onChange={(e) => setJournalDate(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50 font-mono" />
               <select value={executionType} onChange={(e) => setExecutionType(e.target.value)} className="w-full p-1.5 text-sm border rounded bg-slate-50">
                 <option value="perfect">Perfect plan followed</option>
@@ -1670,9 +2061,11 @@ export default function App() {
                   <Award className="h-8 w-8" />
                 </div>
                 <div>
-                  <div className="text-xs text-slate-400 uppercase font-bold tracking-wider">Overall Execution Rating</div>
-                  <div className="text-2xl font-black text-slate-800">{disciplineScore.toFixed(0)}%</div>
-                  <div className="text-[10px] text-slate-500">Perfect Execution Ratio</div>
+                  <div className="text-xs text-slate-400 uppercase font-bold tracking-wider">Execution Integrity (EIS)</div>
+                  <div className="text-2xl font-black text-slate-800">{globalRisk.executionIntegrityScore.toFixed(0)}%</div>
+                  <div className="text-[10px] text-slate-500">
+                    Rolling {globalRisk.eisCompliantCount}/{globalRisk.eisTotalCount || RISK_GUARDRAILS.eisWindowTrades} · lifetime {disciplineScore.toFixed(0)}%
+                  </div>
                 </div>
               </div>
               <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">

@@ -1,1 +1,9 @@
 /node_modules
+/server/node_modules
+/dist
+.env
+.env.local
+server/.env
+atlas-credentials.env
+auth0-config.env
+.DS_Store

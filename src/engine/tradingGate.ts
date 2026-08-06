@@ -128,6 +128,12 @@ export type TradingGateInput = {
   /** True when a prior Live session day was not archived yet (not same calendar day). */
   needsPriorClose?: boolean;
   discipline?: DisciplinePenaltyResult | null;
+  /** GR-06: stop-tamper 48h system lockout */
+  isLockoutActive?: boolean;
+  lockoutExpirationTimestamp?: number | null;
+  /** GR-03: cumulative open portfolio heat over 2% — block new entries */
+  portfolioHeatOverCap?: boolean;
+  portfolioHeatPercent?: number;
 };
 
 /**
@@ -176,6 +182,20 @@ export function getTradingGate(input: TradingGateInput): TradingGateResult {
 
   if (disciplineFactor === 0 && disciplineReason) {
     processReasons.push(disciplineReason);
+  }
+
+  if (input.isLockoutActive) {
+    const until = input.lockoutExpirationTimestamp
+      ? new Date(Number(input.lockoutExpirationTimestamp)).toLocaleString()
+      : '48h window';
+    processReasons.push(`GR-06 stop-tamper lockout active until ${until} — checklist / new entries disabled.`);
+  }
+
+  if (input.portfolioHeatOverCap) {
+    const heat = Number(input.portfolioHeatPercent);
+    processReasons.push(
+      `GR-03 portfolio heat${Number.isFinite(heat) ? ` ${heat.toFixed(2)}%` : ''} exceeds 2.0% — no new entries.`
+    );
   }
 
   const sitOnHands = !!input.sitOnHands;

@@ -8,6 +8,12 @@ export type IbkrPosition = {
   entryPrice?: number;
   /** Manual ISO date YYYY-MM-DD */
   entryDate?: string;
+  /** Manual — initial technical stop at entry (risk heat) */
+  initialStopPrice?: number;
+  /** Manual — trailed / active stop (heat drops to 0 past BE) */
+  activeStopPrice?: number;
+  /** Confirmed live hard bracket in IBKR (GR-05) */
+  hasLiveBracketOrder?: boolean;
 };
 
 export type IbkrPortfolioSnapshot = {
