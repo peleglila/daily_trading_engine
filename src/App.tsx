@@ -303,7 +303,16 @@ function CloudDesk() {
     login: () => {
       void loginWithRedirect();
     },
-    logout: () => logout({ logoutParams: { returnTo: window.location.origin } }),
+    logout: () =>
+      logout({
+        logoutParams: {
+          returnTo: (() => {
+            const { origin, pathname } = window.location;
+            const dir = pathname.replace(/\/index\.html$/i, '').replace(/\/$/, '');
+            return `${origin}${dir || ''}` || origin;
+          })(),
+        },
+      }),
     getToken,
   };
 
@@ -326,12 +335,19 @@ export default function App() {
   const cloud = isCloudConfigured();
   if (!cloud) return <LocalDesk />;
 
+  // GitHub Project Pages: app is at /repo/, not site root — Auth0 needs the full path.
+  const redirectUri = (() => {
+    const { origin, pathname } = window.location;
+    const dir = pathname.replace(/\/index\.html$/i, '').replace(/\/$/, '');
+    return `${origin}${dir || ''}` || origin;
+  })();
+
   return (
     <Auth0Provider
       domain={import.meta.env.VITE_AUTH0_DOMAIN}
       clientId={import.meta.env.VITE_AUTH0_CLIENT_ID}
       authorizationParams={{
-        redirect_uri: window.location.origin,
+        redirect_uri: redirectUri,
         audience: import.meta.env.VITE_AUTH0_AUDIENCE,
       }}
       cacheLocation="localstorage"
