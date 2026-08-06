@@ -243,12 +243,32 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: err.message || 'Server error' });
 });
 
+/** Cold starts (Render free) often miss Atlas on first try — keep retrying in background. */
+function scheduleMongoRetry() {
+  if (!MONGODB_URI || isDbConnected()) return;
+  let attempt = 0;
+  const tick = async () => {
+    if (isDbConnected()) return;
+    attempt += 1;
+    try {
+      await connectDb(MONGODB_URI, { force: true });
+      console.log(`MongoDB connected (retry #${attempt})`);
+    } catch (err) {
+      console.error(`MongoDB retry #${attempt} failed:`, err.message || err);
+      const delay = Math.min(60_000, 5_000 * attempt);
+      setTimeout(tick, delay);
+    }
+  };
+  setTimeout(tick, 3000);
+}
+
 async function main() {
   try {
     await connectDb(MONGODB_URI);
     console.log('MongoDB connected');
   } catch (err) {
     console.error('MongoDB unavailable — starting API without day persistence.', err.message || err);
+    scheduleMongoRetry();
   }
 
   await new Promise((resolve, reject) => {

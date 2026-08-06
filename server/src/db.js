@@ -16,9 +16,9 @@ export async function connectDb(uri, { force = false } = {}) {
     db = null;
   }
   client = new MongoClient(uri, {
-    serverSelectionTimeoutMS: 10000,
-    connectTimeoutMS: 10000,
-    family: 4, // Windows: prefer IPv4 — avoids some Atlas TLS flakes
+    serverSelectionTimeoutMS: 20000,
+    connectTimeoutMS: 20000,
+    family: 4, // prefer IPv4 — avoids some Atlas TLS flakes
   });
   await client.connect();
   db = client.db();
