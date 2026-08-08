@@ -274,22 +274,11 @@ export function DailyDashboard({
         />
       </section>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <PnLChart
-          series={equitySeries}
-          baseEquity={book.baseEquity}
-          peakEquity={book.peakEquity}
-        />
-        <section className="panel p-4">
-          <h3 className="font-display text-lg mb-2">Game plan</h3>
-          <textarea
-            className="input min-h-[180px] resize-y"
-            placeholder="What matters today? Bias, levels, no-trade conditions…"
-            value={plan.gamePlan}
-            onChange={(e) => onPlanChange({ ...plan, gamePlan: e.target.value })}
-          />
-        </section>
-      </div>
+      <PnLChart
+        series={equitySeries}
+        baseEquity={book.baseEquity}
+        peakEquity={book.peakEquity}
+      />
 
       {marketFocus === 'equal' ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -331,20 +320,28 @@ export function DailyDashboard({
         />
       )}
 
-      <div className="space-y-4">
-        <div className="max-w-xl">
-          <SoftPreFlight
-            equity={book.netLiq}
-            onAdd={addWatch}
-            onSelectTicker={setChartTicker}
-          />
-        </div>
-        <WatchlistPanel
-          items={plan.watchlist}
-          onChange={(watchlist) => onPlanChange({ ...plan, watchlist })}
-          onOpenChart={setChartTicker}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <SoftPreFlight
+          equity={book.netLiq}
+          onAdd={addWatch}
+          onSelectTicker={setChartTicker}
         />
+        <section className="panel p-4 flex flex-col">
+          <h3 className="font-display text-lg mb-2">Game plan</h3>
+          <textarea
+            className="input min-h-[220px] flex-1 resize-y"
+            placeholder="What matters today? Bias, levels, no-trade conditions…"
+            value={plan.gamePlan}
+            onChange={(e) => onPlanChange({ ...plan, gamePlan: e.target.value })}
+          />
+        </section>
       </div>
+
+      <WatchlistPanel
+        items={plan.watchlist}
+        onChange={(watchlist) => onPlanChange({ ...plan, watchlist })}
+        onOpenChart={setChartTicker}
+      />
 
       <TvChartPanel
         symbol={chartTicker}

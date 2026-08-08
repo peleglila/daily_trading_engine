@@ -51,7 +51,7 @@ export function PnLChart({ series, baseEquity = 0, peakEquity = 0 }: Props) {
           Set Base + ATH below, import today’s book, and save a few days to build the curve.
         </p>
       ) : (
-        <div className="h-56">
+        <div className="h-64 md:h-72">
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={data}>
               <defs>
