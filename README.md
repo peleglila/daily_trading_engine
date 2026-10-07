@@ -57,6 +57,8 @@ Open the Vite URL. No Auth0/Atlas required.
 | `AUTH0_DOMAIN` | `YOUR_TENANT.auth0.com` |
 | `AUTH0_AUDIENCE` | `https://peleg-trading-api` |
 | `ALLOWED_USERS` | `you@example.com` (optional) |
+| `IBKR_FLEX_TOKEN` | Flex Web Service token (server only) |
+| `IBKR_FLEX_QUERY_ID` | Flex query id, e.g. `1664311` |
 
 4. Deploy → copy the service URL, e.g. `https://peleg-trading-api.onrender.com`
 5. Check `https://<your-service>.onrender.com/health` → `"ok": true` (and `"mongo": true` when Atlas is reachable)

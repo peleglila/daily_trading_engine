@@ -21,3 +21,7 @@ services:
         sync: false
       - key: ALLOWED_USERS
         sync: false
+      - key: IBKR_FLEX_TOKEN
+        sync: false
+      - key: IBKR_FLEX_QUERY_ID
+        sync: false
