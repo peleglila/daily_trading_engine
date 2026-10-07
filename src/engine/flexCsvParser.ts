@@ -204,8 +204,10 @@ export function parseFlexOrCsv(text: string): {
   const iFifo = col(headers, [
     'fifopnlunrealized',
     'fifo pnl unrealized',
+    'unrealized p/l',
     'unrealized pnl',
     'unrealized p&l',
+    'unrealizedpl',
     'fifopnl',
   ]);
   const iValue = col(headers, ['position value', 'value', 'market value', 'positionvalue']);

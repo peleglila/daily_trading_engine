@@ -1,19 +1,23 @@
-import React, { useMemo, useRef, useState } from 'react';
-import { RefreshCw, Save, Upload, Camera } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { RefreshCw, Save, Upload, Camera, Download } from 'lucide-react';
 import { HeatRail } from '../ui/HeatRail';
 import { PositionsTable } from '../ui/PositionsTable';
 import { SoftPreFlight } from '../ui/SoftPreFlight';
 import { WatchlistPanel } from '../ui/WatchlistPanel';
+import { RichTextEditor } from '../ui/RichTextEditor';
 import { TvChartPanel } from '../ui/TvChartPanel';
 import { PnLChart } from '../ui/PnLChart';
 import { ImportHelpModal } from '../ui/ImportHelpModal';
 import { parseFlexOrCsv } from '../engine/flexCsvParser';
 import { fetchQuotes } from '../engine/quoteService';
+import { fetchFlexStatement } from '../api/client';
 import { computeDayMetrics, raisePeakIfNeeded, recomputeBook } from '../engine/bookMetrics';
 import { DraftNumberInput } from '../ui/DraftNumberInput';
 import { parseIbkrPortfolioText } from '../engine/ibkrOcrParser';
 import { createWorker } from 'tesseract.js';
 import type { BookPosition, DailyBook, DayPlan, WatchlistItem } from '../types/dayBook';
+
+const MARK_POLL_MS = 5 * 60 * 1000;
 
 type Props = {
   date: string;
@@ -22,7 +26,9 @@ type Props = {
   equitySeries: { date: string; equity: number }[];
   cloudEnabled: boolean;
   saving: boolean;
-  onBookChange: (book: DailyBook) => void;
+  /** Bumps when the day is loaded so marks refresh on entry and reload. */
+  reloadTick: number;
+  onBookChange: Dispatch<SetStateAction<DailyBook>>;
   onPlanChange: (plan: DayPlan) => void;
   onSaveDay: () => void;
   onUploadSnapshot: (context: string, blob: Blob) => Promise<void>;
@@ -35,6 +41,7 @@ export function DailyDashboard({
   equitySeries,
   cloudEnabled,
   saving,
+  reloadTick,
   onBookChange,
   onPlanChange,
   onSaveDay,
@@ -45,8 +52,12 @@ export function DailyDashboard({
   /** equal | spy | qqq — expand one market chart, shrink the other */
   const [marketFocus, setMarketFocus] = useState<'equal' | 'spy' | 'qqq'>('equal');
   const [status, setStatus] = useState('');
+  const [marksNote, setMarksNote] = useState('');
   const [ocrBusy, setOcrBusy] = useState(false);
+  const [flexBusy, setFlexBusy] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const bookRef = useRef(book);
+  bookRef.current = book;
 
   const metrics = useMemo(() => computeDayMetrics(book), [book]);
   const dayPL = (Number(book.realizedPL) || 0) + (Number(book.unrealizedPL) || 0);
@@ -56,11 +67,19 @@ export function DailyDashboard({
   };
 
   const applyParsedBook = (partial: Partial<DailyBook>, notes: string[]) => {
+    const incoming = partial.positions || [];
+    const positions = incoming.length
+      ? incoming.map((next) => {
+          const prev = book.positions.find((p) => p.ticker.toUpperCase() === next.ticker.toUpperCase());
+          if (prev?.manualStop == null) return next;
+          return { ...next, manualStop: prev.manualStop };
+        })
+      : book.positions;
     const merged = raisePeakIfNeeded(
       recomputeBook({
         ...book,
         ...partial,
-        positions: partial.positions || book.positions,
+        positions,
         netLiq: partial.netLiq ?? book.netLiq,
         realizedPL: partial.realizedPL ?? book.realizedPL,
         unrealizedPL: partial.unrealizedPL ?? book.unrealizedPL,
@@ -72,6 +91,20 @@ export function DailyDashboard({
     );
     onBookChange(merged);
     setStatus(notes.join(' '));
+  };
+
+  const pullFlex = async () => {
+    setFlexBusy(true);
+    setStatus('Pulling open positions from IBKR…');
+    try {
+      const text = await fetchFlexStatement();
+      const { book: partial, notes } = parseFlexOrCsv(text);
+      applyParsedBook(partial, notes.length ? notes : ['IBKR Flex imported.']);
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : 'IBKR pull failed.');
+    } finally {
+      setFlexBusy(false);
+    }
   };
 
   const onImportFile = async (file: File) => {
@@ -120,22 +153,76 @@ export function DailyDashboard({
     applyParsedBook(partial, notes);
   };
 
-  const refreshMarks = async () => {
-    const tickers = [
-      ...book.positions.map((p) => p.ticker),
-      ...plan.watchlist.map((w) => w.ticker),
-    ];
-    setStatus('Refreshing live marks…');
+  const refreshMarks = useCallback(async (quiet = false) => {
+    const tickers = bookRef.current.positions.map((p) => p.ticker);
+    if (!tickers.some((t) => t.trim())) {
+      if (!quiet) setStatus('No open positions to mark.');
+      return;
+    }
+    if (!quiet) setStatus('Refreshing live marks…');
     const quotes = await fetchQuotes(tickers);
-    const positions = book.positions.map((p) => {
-      const q = quotes[p.ticker];
-      if (!q) return p;
-      return { ...p, lastMark: q.price, markSource: 'live' as const, markAt: q.at };
+    const at = new Date().toISOString();
+    onBookChange((prev) => {
+      const positions = prev.positions.map((p) => {
+        const q = quotes[p.ticker.trim().toUpperCase()];
+        if (!q) return p;
+        return { ...p, lastMark: q.price, markSource: 'live' as const, markAt: q.at };
+      });
+      return recomputeBook({ ...prev, positions, asOf: at });
     });
-    onBookChange(recomputeBook({ ...book, positions, asOf: new Date().toISOString() }));
     const n = Object.keys(quotes).length;
-    setStatus(n ? `Updated ${n} live marks.` : 'No live quotes returned — edit marks manually.');
-  };
+    const clock = new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    setMarksNote(n ? `Live marks ${clock}` : `No live quotes ${clock}`);
+    if (!quiet) {
+      setStatus(n ? `Updated ${n} live marks.` : 'No live quotes returned — edit marks manually.');
+    }
+  }, [onBookChange]);
+
+  const tickerKey = useMemo(
+    () =>
+      [...new Set(book.positions.map((p) => p.ticker.trim().toUpperCase()).filter(Boolean))]
+        .sort()
+        .join(','),
+    [book.positions]
+  );
+
+  useEffect(() => {
+    if (!tickerKey) return;
+    let cancelled = false;
+    let kickTimer = 0;
+    let interval = 0;
+
+    const run = () => {
+      if (cancelled || document.visibilityState !== 'visible') return;
+      void refreshMarks(true);
+    };
+
+    const arm = () => {
+      window.clearInterval(interval);
+      if (document.visibilityState !== 'visible') return;
+      interval = window.setInterval(run, MARK_POLL_MS);
+    };
+
+    kickTimer = window.setTimeout(run, 400);
+    arm();
+
+    const onVis = () => {
+      if (document.visibilityState === 'visible') {
+        run();
+        arm();
+      } else {
+        window.clearInterval(interval);
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(kickTimer);
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [reloadTick, tickerKey, refreshMarks]);
 
   const addWatch = (item: WatchlistItem) => {
     setChartTicker(item.ticker);
@@ -160,12 +247,15 @@ export function DailyDashboard({
         </div>
         <div className="flex flex-wrap gap-2 items-center">
           <div className="inline-flex items-center gap-1.5">
-            <button type="button" className="btn-secondary inline-flex items-center gap-2" onClick={() => fileRef.current?.click()} disabled={ocrBusy}>
+            <button type="button" className="btn-secondary inline-flex items-center gap-2" onClick={() => void pullFlex()} disabled={flexBusy || ocrBusy}>
+              <Download className="h-4 w-4" /> {flexBusy ? 'Pulling…' : 'Pull from IBKR'}
+            </button>
+            <button type="button" className="btn-secondary inline-flex items-center gap-2" onClick={() => fileRef.current?.click()} disabled={ocrBusy || flexBusy}>
               <Upload className="h-4 w-4" /> Import Flex / CSV / OCR
             </button>
             <ImportHelpModal />
           </div>
-          <button type="button" className="btn-secondary inline-flex items-center gap-2" onClick={refreshMarks}>
+          <button type="button" className="btn-secondary inline-flex items-center gap-2" onClick={() => void refreshMarks(false)}>
             <RefreshCw className="h-4 w-4" /> Refresh marks
           </button>
           <button type="button" className="btn-primary inline-flex items-center gap-2" onClick={onSaveDay} disabled={saving}>
@@ -232,7 +322,12 @@ export function DailyDashboard({
 
       <section>
         <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-          <h2 className="font-display text-xl">Open positions</h2>
+          <div className="flex items-baseline gap-3">
+            <h2 className="font-display text-xl">Open positions</h2>
+            <span className="text-[11px] font-data text-[var(--ink-mute)]">
+              {marksNote || 'Marks refresh every 5 min while this tab is visible'}
+            </span>
+          </div>
           <div className="flex flex-wrap items-center gap-3">
             <label className="field-inline">
               <span className="text-[11px] text-[var(--ink-mute)]">Base</span>
@@ -328,17 +423,17 @@ export function DailyDashboard({
         />
         <section className="panel p-4 flex flex-col">
           <h3 className="font-display text-lg mb-2">Game plan</h3>
-          <textarea
-            className="input min-h-[220px] flex-1 resize-y"
-            placeholder="What matters today? Bias, levels, no-trade conditions…"
+          <RichTextEditor
             value={plan.gamePlan}
-            onChange={(e) => onPlanChange({ ...plan, gamePlan: e.target.value })}
+            placeholder="What matters today? Bias, levels, no-trade conditions…"
+            onChange={(gamePlan) => onPlanChange({ ...plan, gamePlan })}
           />
         </section>
       </div>
 
       <WatchlistPanel
         items={plan.watchlist}
+        equity={book.netLiq}
         onChange={(watchlist) => onPlanChange({ ...plan, watchlist })}
         onOpenChart={setChartTicker}
       />

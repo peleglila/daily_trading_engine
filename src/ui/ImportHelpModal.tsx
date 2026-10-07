@@ -57,7 +57,15 @@ export function ImportHelpModal() {
 
             <div className="space-y-4 px-4 py-4 text-sm text-[var(--ink)] leading-relaxed">
               <section>
-                <h3 className="font-display text-base mb-1">Best: Flex CSV</h3>
+                <h3 className="font-display text-base mb-1">Pull from IBKR</h3>
+                <p className="text-[13px]">
+                  Use <strong>Pull from IBKR</strong> once the Flex query is saved. The token stays on the API.
+                  The file is last business day’s book. Stops you already typed are kept.
+                </p>
+              </section>
+
+              <section>
+                <h3 className="font-display text-base mb-1">Or upload the Flex CSV</h3>
                 <ol className="list-decimal pl-4 space-y-1 text-[13px] text-[var(--ink)]">
                   <li>
                     IBKR Account Management → <strong>Reports → Flex Queries</strong>
@@ -71,15 +79,17 @@ export function ImportHelpModal() {
                     <strong>TotalRealizedPnl</strong>
                   </li>
                   <li>
-                    Columns: <strong>Symbol, Quantity, CostBasisPrice, MarkPrice, FifoPnlUnrealized</strong>
+                    In Open Positions, check <strong>Symbol, Quantity, Mark Price, Cost Basis Price, Unrealized P/L</strong>.
+                    That unrealized column is the old FifoPnlUnrealized field.
                   </li>
                   <li>
                     Delivery format: <strong>CSV</strong> → run → download → upload here
                   </li>
                 </ol>
                 <p className="mt-2 text-[12px] text-[var(--ink-mute)]">
-                  Your current Flex file works. Set <strong>Net Liq</strong>, <strong>Base</strong>, and{' '}
-                  <strong>ATH</strong> in the app (not in Flex). Stops stay manual.
+                  Closed P&L is not in this list. Add a separate section,{' '}
+                  <strong>Realized and Unrealized Performance Summary</strong>, or type realized P&L in the desk.
+                  Set <strong>Net Liq</strong>, <strong>Base</strong>, and <strong>ATH</strong> in the app. Stops stay manual.
                 </p>
               </section>
 

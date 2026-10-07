@@ -136,6 +136,11 @@ export function PositionsTable({ positions, netLiq, onChange, onOpenChart }: Pro
                     type="number"
                     step="0.01"
                     className="input-compact text-right w-24"
+                    title={
+                      p.markSource === 'live'
+                        ? `Live mark${p.markAt ? ` · ${new Date(p.markAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}` : ''}`
+                        : 'Manual mark'
+                    }
                     value={p.lastMark || ''}
                     onChange={(e) =>
                       update(idx, {

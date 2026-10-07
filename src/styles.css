@@ -64,6 +64,13 @@ body {
 .input-compact { padding: 0.35rem 0.5rem; font-size: 0.8rem; }
 
 .field { display: flex; flex-direction: column; gap: 0.25rem; font-size: 11px; font-weight: 600; color: var(--ink-mute); text-transform: uppercase; letter-spacing: 0.06em; }
+.field textarea {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+  font-size: 0.875rem;
+  color: var(--ink);
+}
 .field-inline { display: flex; align-items: center; gap: 0.5rem; }
 
 .btn-primary, .btn-secondary, .btn-ghost {
@@ -109,6 +116,57 @@ body {
 
 .no-scrollbar { scrollbar-width: none; }
 .no-scrollbar::-webkit-scrollbar { display: none; }
+
+.day-btn {
+  user-select: none;
+}
+button.day-today {
+  border-color: var(--copper);
+  box-shadow: inset 0 3px 0 var(--copper);
+}
+.day-selected {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+.grade-locked { background: rgba(47, 111, 120, 0.18); border-color: #2f6f78; color: var(--ink); }
+.grade-steady { background: rgba(36, 72, 112, 0.14); border-color: #3d5f86; color: var(--ink); }
+.grade-loose { background: rgba(184, 115, 51, 0.2); border-color: var(--copper); color: var(--ink); }
+.grade-off { background: rgba(166, 61, 61, 0.16); border-color: var(--alert); color: var(--ink); }
+
+.rte-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+}
+.rte-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.75rem;
+  height: 1.75rem;
+  padding: 0 0.35rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.rte-btn:hover, .rte-btn:focus-visible { border-color: var(--copper); color: var(--copper); }
+.rte-swatch {
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  border: 1px solid rgba(21, 32, 51, 0.25);
+}
+.rte-swatch:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.rte {
+  min-height: 220px;
+  white-space: pre-wrap;
+}
+.rte ul { margin: 0.35rem 0 0.35rem 1.15rem; list-style: disc; }
+.rte:focus { border-color: var(--copper); box-shadow: 0 0 0 3px rgba(184, 115, 51, 0.15); }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }

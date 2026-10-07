@@ -24,6 +24,14 @@ async function apiFetch(
   return fetch(`${API_URL}${path}`, { ...init, headers });
 }
 
+export async function fetchFlexStatement(): Promise<string> {
+  const res = await apiFetch('/api/ibkr/flex', null, { method: 'POST' });
+  const json = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
+  if (!res.ok) throw new Error(json.error || 'Could not pull the Flex statement.');
+  if (!json.text) throw new Error('Flex statement was empty.');
+  return json.text;
+}
+
 export async function fetchDay(date: string, token: string): Promise<DayDocument | null> {
   const res = await apiFetch(`/api/days/${date}`, token);
   if (res.status === 404) return null;

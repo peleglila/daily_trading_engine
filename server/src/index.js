@@ -5,6 +5,7 @@ import multer from 'multer';
 import { Binary } from 'mongodb';
 import { connectDb, getDb, isDbConnected } from './db.js';
 import { allowlistGuard, attachUser, createAuthMiddleware } from './auth.js';
+import { fetchFlexStatement } from './flex.js';
 
 const app = express();
 const upload = multer({
@@ -105,6 +106,21 @@ app.get('/api/quotes/:symbol', async (req, res) => {
   }
 });
 
+/** Pull today's Flex CSV. Token stays in server env; the browser only receives the statement text. */
+app.post('/api/ibkr/flex', async (_req, res) => {
+  try {
+    const text = await fetchFlexStatement({
+      token: process.env.IBKR_FLEX_TOKEN,
+      queryId: process.env.IBKR_FLEX_QUERY_ID,
+    });
+    res.json({ text });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error('flex pull failed', err.message || err);
+    res.status(status).json({ error: err.message || 'Flex pull failed' });
+  }
+});
+
 const checkJwt = createAuthMiddleware({ domain: AUTH0_DOMAIN, audience: AUTH0_AUDIENCE });
 const requireUser = [checkJwt, attachUser, allowlistGuard(ALLOWED_USERS)];
 
@@ -152,6 +168,7 @@ app.put('/api/days/:date', ...requireUser, async (req, res, next) => {
       book: req.body.book || {},
       plan: req.body.plan || {},
       metrics: req.body.metrics || {},
+      review: req.body.review || null,
       saved: !!req.body.saved,
       updatedAt: now,
     };

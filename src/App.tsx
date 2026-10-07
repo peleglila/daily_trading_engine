@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Auth0Provider, useAuth0 } from '@auth0/auth0-react';
 import { DailyDashboard } from './pages/DailyDashboard';
 import { CalendarArchive } from './pages/CalendarArchive';
@@ -11,6 +11,7 @@ import {
   type DailyBook,
   type DayDocument,
   type DayPlan,
+  type DayReview,
 } from './types/dayBook';
 import { computeDayMetrics, recomputeBook } from './engine/bookMetrics';
 import {
@@ -97,14 +98,53 @@ function Desk({ auth }: { auth: AuthBridge }) {
   const [days, setDays] = useState<DayDocument[]>(() => loadLocalDays());
   const [saving, setSaving] = useState(false);
   const [banner, setBanner] = useState('');
+  const [reloadTick, setReloadTick] = useState(0);
+  const reviewCloudTimer = useRef<number | undefined>(undefined);
+  /** Date just changed — book state is still the previous day. Don't write that into the new date's draft. */
+  const skipDraftWrite = useRef(true);
 
   useEffect(() => {
-    const d = loadLocalDraft(date);
-    setBook(d.book);
-    setPlan(d.plan);
+    skipDraftWrite.current = true;
+    const account = loadAccountSettings();
+    let nextBook = withAccountSettings(emptyBook(), account);
+    let nextPlan = emptyPlan();
+    let fromDraft = false;
+    try {
+      const raw = localStorage.getItem(LOCAL_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed.date === date) {
+          nextBook = withAccountSettings(
+            recomputeBook({ ...emptyBook(), ...(parsed.book || {}) }),
+            account
+          );
+          nextPlan = { ...emptyPlan(), ...(parsed.plan || {}) };
+          fromDraft = true;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    if (!fromDraft) {
+      const saved = loadLocalDays().find((d) => d.date === date);
+      if (saved?.book) {
+        nextBook = withAccountSettings(
+          recomputeBook({ ...emptyBook(), ...(saved.book || {}) }),
+          account
+        );
+        nextPlan = { ...emptyPlan(), ...(saved.plan || {}) };
+      }
+    }
+    setBook(nextBook);
+    setPlan(nextPlan);
+    setReloadTick((n) => n + 1);
   }, [date]);
 
   useEffect(() => {
+    if (skipDraftWrite.current) {
+      skipDraftWrite.current = false;
+      return;
+    }
     localStorage.setItem(LOCAL_KEY, JSON.stringify({ date, book, plan }));
     localStorage.setItem(
       LOCAL_ACCOUNT_KEY,
@@ -122,11 +162,21 @@ function Desk({ auth }: { auth: AuthBridge }) {
         const token = await auth.getToken();
         if (!token) return;
         const remoteDays = await listDays(token);
-        setDays(remoteDays);
+        setDays((prev) => {
+          const remoteDates = new Set(remoteDays.map((d) => d.date));
+          const merged = remoteDays.map((remote) => {
+            const local = prev.find((d) => d.date === remote.date);
+            if (local?.review && !remote.review) return { ...remote, review: local.review };
+            return remote;
+          });
+          const localOnly = prev.filter((d) => !remoteDates.has(d.date) && (d.review || d.saved));
+          return [...merged, ...localOnly];
+        });
         const today = await fetchDay(date, token);
         if (today?.book) {
           setBook(withAccountSettings(recomputeBook({ ...emptyBook(), ...today.book })));
           setPlan({ ...emptyPlan(), ...(today.plan || {}) });
+          setReloadTick((n) => n + 1);
         } else {
           setBook((prev) => withAccountSettings(prev));
         }
@@ -162,11 +212,13 @@ function Desk({ auth }: { auth: AuthBridge }) {
     setSaving(true);
     setBanner('');
     const metrics = computeDayMetrics(book);
+    const existing = days.find((d) => d.date === date);
     const doc: DayDocument = {
       date,
       book,
       plan,
       metrics,
+      review: existing?.review,
       saved: true,
       updatedAt: new Date().toISOString(),
     };
@@ -194,6 +246,40 @@ function Desk({ auth }: { auth: AuthBridge }) {
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleReviewChange = (iso: string, review: DayReview) => {
+    setDays((prev) => {
+      const found = prev.find((d) => d.date === iso);
+      const doc: DayDocument = found
+        ? { ...found, review, updatedAt: new Date().toISOString() }
+        : {
+            date: iso,
+            book: emptyBook(),
+            plan: emptyPlan(),
+            metrics: computeDayMetrics(emptyBook()),
+            review,
+            saved: false,
+            updatedAt: new Date().toISOString(),
+          };
+      const next = [doc, ...prev.filter((d) => d.date !== iso)];
+      localStorage.setItem(LOCAL_DAYS_KEY, JSON.stringify(next));
+      if (auth.cloud && auth.isAuthenticated && found) {
+        window.clearTimeout(reviewCloudTimer.current);
+        reviewCloudTimer.current = window.setTimeout(() => {
+          void (async () => {
+            try {
+              const token = await auth.getToken();
+              if (!token) return;
+              await saveDay(iso, doc, token);
+            } catch {
+              /* local copy remains */
+            }
+          })();
+        }, 700);
+      }
+      return next;
+    });
   };
 
   const handleUploadSnapshot = async (context: string, blob: Blob) => {
@@ -266,6 +352,7 @@ function Desk({ auth }: { auth: AuthBridge }) {
             equitySeries={equitySeries}
             cloudEnabled={auth.cloud && auth.isAuthenticated}
             saving={saving}
+            reloadTick={reloadTick}
             onBookChange={setBook}
             onPlanChange={setPlan}
             onSaveDay={handleSaveDay}
@@ -278,6 +365,7 @@ function Desk({ auth }: { auth: AuthBridge }) {
               setDate(d);
               setView('daily');
             }}
+            onReviewChange={handleReviewChange}
           />
         )}
       </div>

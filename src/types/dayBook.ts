@@ -40,6 +40,8 @@ export type WatchlistItem = {
   allowedRiskPct: number;
   allowedRiskDollars: number;
   sharesPreview: number;
+  /** Dollar size at entry. Filled from entry, stop, and risk %. */
+  positionValue?: number;
   tactics: string;
   direction: 'long' | 'short';
 };
@@ -48,6 +50,19 @@ export type DayPlan = {
   gamePlan: string;
   watchlist: WatchlistItem[];
 };
+
+/** How the session was traded — process, not P&L. */
+export type ProcessGrade = 'locked' | 'steady' | 'loose' | 'off';
+
+export type DayReview = {
+  grade: ProcessGrade | null;
+  wentRight: string;
+  wentWrong: string;
+};
+
+export function emptyReview(): DayReview {
+  return { grade: null, wentRight: '', wentWrong: '' };
+}
 
 export type DayMetrics = {
   portfolioHeatPercent: number;
@@ -62,6 +77,7 @@ export type DayDocument = {
   book: DailyBook;
   plan: DayPlan;
   metrics: DayMetrics;
+  review?: DayReview;
   saved: boolean;
   updatedAt?: string;
 };
