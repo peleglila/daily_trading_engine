@@ -64,6 +64,18 @@ export function emptyReview(): DayReview {
   return { grade: null, wentRight: '', wentWrong: '' };
 }
 
+/** A saved trading day, including Atlas history from before post-day review existed. */
+export function dayHasBook(day?: DayDocument | null): boolean {
+  if (!day) return false;
+  if (day.saved) return true;
+  if ((day.book?.positions?.length || 0) > 0) return true;
+  if (Number(day.book?.netLiq) > 0) return true;
+  if (Number(day.book?.realizedPL) !== 0 || Number(day.book?.unrealizedPL) !== 0) return true;
+  if ((day.plan?.watchlist?.length || 0) > 0) return true;
+  const plan = (day.plan?.gamePlan || '').replace(/<[^>]+>/g, '').trim();
+  return plan.length > 0;
+}
+
 export type DayMetrics = {
   portfolioHeatPercent: number;
   openRiskDollars: number;

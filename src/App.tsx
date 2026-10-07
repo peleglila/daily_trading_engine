@@ -7,6 +7,7 @@ import {
   emptyBook,
   emptyPlan,
   todayISO,
+  dayHasBook,
   type AccountSettings,
   type DailyBook,
   type DayDocument,
@@ -19,6 +20,7 @@ import {
   isCloudConfigured,
   listDays,
   saveDay,
+  saveDayReview,
   uploadSnapshot,
 } from './api/client';
 
@@ -99,7 +101,11 @@ function Desk({ auth }: { auth: AuthBridge }) {
   const [saving, setSaving] = useState(false);
   const [banner, setBanner] = useState('');
   const [reloadTick, setReloadTick] = useState(0);
+  const [reviewSync, setReviewSync] = useState('');
   const reviewCloudTimer = useRef<number | undefined>(undefined);
+  const flushedReviews = useRef(false);
+  const daysRef = useRef(days);
+  daysRef.current = days;
   /** Date just changed — book state is still the previous day. Don't write that into the new date's draft. */
   const skipDraftWrite = useRef(true);
 
@@ -126,8 +132,10 @@ function Desk({ auth }: { auth: AuthBridge }) {
       /* ignore */
     }
     if (!fromDraft) {
-      const saved = loadLocalDays().find((d) => d.date === date);
-      if (saved?.book) {
+      const saved =
+        daysRef.current.find((d) => String(d.date || '').slice(0, 10) === date) ||
+        loadLocalDays().find((d) => String(d.date || '').slice(0, 10) === date);
+      if (saved && dayHasBook(saved)) {
         nextBook = withAccountSettings(
           recomputeBook({ ...emptyBook(), ...(saved.book || {}) }),
           account
@@ -248,6 +256,54 @@ function Desk({ auth }: { auth: AuthBridge }) {
     }
   };
 
+  const queueReviewSync = useCallback(
+    (iso: string, review: DayReview) => {
+      if (!auth.cloud || !auth.isAuthenticated) {
+        setReviewSync('Saved on this device');
+        return;
+      }
+      setReviewSync('Saving to Atlas…');
+      window.clearTimeout(reviewCloudTimer.current);
+      reviewCloudTimer.current = window.setTimeout(() => {
+        void (async () => {
+          try {
+            const token = await auth.getToken();
+            if (!token) {
+              setReviewSync('Saved on this device');
+              return;
+            }
+            await saveDayReview(iso, review, token);
+            setReviewSync('Saved to Atlas');
+          } catch {
+            setReviewSync('Saved on this device — Atlas did not update');
+          }
+        })();
+      }, 700);
+    },
+    [auth]
+  );
+
+  useEffect(() => {
+    if (flushedReviews.current || !auth.cloud || !auth.isAuthenticated) return;
+    flushedReviews.current = true;
+    const pending = loadLocalDays().filter(
+      (d) => d.review && (d.review.grade || d.review.wentRight.trim() || d.review.wentWrong.trim())
+    );
+    if (!pending.length) return;
+    void (async () => {
+      try {
+        const token = await auth.getToken();
+        if (!token) return;
+        for (const day of pending) {
+          if (day.review) await saveDayReview(day.date, day.review, token);
+        }
+        setReviewSync('Saved to Atlas');
+      } catch {
+        setReviewSync('Saved on this device — Atlas did not update');
+      }
+    })();
+  }, [auth.cloud, auth.isAuthenticated, auth]);
+
   const handleReviewChange = (iso: string, review: DayReview) => {
     setDays((prev) => {
       const found = prev.find((d) => d.date === iso);
@@ -264,22 +320,9 @@ function Desk({ auth }: { auth: AuthBridge }) {
           };
       const next = [doc, ...prev.filter((d) => d.date !== iso)];
       localStorage.setItem(LOCAL_DAYS_KEY, JSON.stringify(next));
-      if (auth.cloud && auth.isAuthenticated && found) {
-        window.clearTimeout(reviewCloudTimer.current);
-        reviewCloudTimer.current = window.setTimeout(() => {
-          void (async () => {
-            try {
-              const token = await auth.getToken();
-              if (!token) return;
-              await saveDay(iso, doc, token);
-            } catch {
-              /* local copy remains */
-            }
-          })();
-        }, 700);
-      }
       return next;
     });
+    queueReviewSync(iso, review);
   };
 
   const handleUploadSnapshot = async (context: string, blob: Blob) => {
@@ -366,6 +409,7 @@ function Desk({ auth }: { auth: AuthBridge }) {
               setView('daily');
             }}
             onReviewChange={handleReviewChange}
+            reviewSync={reviewSync}
           />
         )}
       </div>

@@ -1,12 +1,13 @@
 import React, { useMemo, useState } from 'react';
 import type { DayDocument, DayReview } from '../types/dayBook';
-import { emptyReview, todayISO } from '../types/dayBook';
+import { dayHasBook, emptyReview, todayISO } from '../types/dayBook';
 import { PROCESS_GRADES, processGradeMeta } from '../ui/processGrades';
 
 type Props = {
   days: DayDocument[];
   onOpenDay: (date: string) => void;
   onReviewChange: (date: string, review: DayReview) => void;
+  reviewSync?: string;
 };
 
 function monthMatrix(year: number, month: number) {
@@ -24,7 +25,7 @@ function isoDate(year: number, month: number, day: number) {
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-export function CalendarArchive({ days, onOpenDay, onReviewChange }: Props) {
+export function CalendarArchive({ days, onOpenDay, onReviewChange, reviewSync }: Props) {
   const [cursor, setCursor] = useState(() => {
     const n = new Date();
     return { y: n.getFullYear(), m: n.getMonth() };
@@ -33,7 +34,10 @@ export function CalendarArchive({ days, onOpenDay, onReviewChange }: Props) {
 
   const byDate = useMemo(() => {
     const map = new Map<string, DayDocument>();
-    days.forEach((d) => map.set(d.date, d));
+    days.forEach((d) => {
+      const key = String(d.date || '').slice(0, 10);
+      if (key) map.set(key, d);
+    });
     return map;
   }, [days]);
 
@@ -95,6 +99,7 @@ export function CalendarArchive({ days, onOpenDay, onReviewChange }: Props) {
             const iso = isoDate(cursor.y, cursor.m, day);
             const saved = byDate.get(iso);
             const grade = processGradeMeta(saved?.review?.grade);
+            const hasBook = dayHasBook(saved);
             const isToday = iso === today;
             const isSelected = selected === iso;
             return (
@@ -105,20 +110,27 @@ export function CalendarArchive({ days, onOpenDay, onReviewChange }: Props) {
                 onDoubleClick={() => onOpenDay(iso)}
                 title="Click to review. Double-click to open the day."
                 className={`day-btn aspect-square overflow-hidden rounded-xl border text-sm font-data flex flex-col items-center justify-center leading-tight transition-colors ${
-                  grade ? `grade-${grade.id}` : 'border-[var(--line)] text-[var(--ink-mute)] hover:bg-white/60'
+                  grade
+                    ? `grade-${grade.id}`
+                    : hasBook
+                      ? 'day-book'
+                      : 'border-[var(--line)] text-[var(--ink-mute)] hover:bg-white/60'
                 } ${isToday ? 'day-today' : ''} ${isSelected ? 'day-selected' : ''}`}
               >
-                <div className={isToday ? 'font-semibold text-[var(--ink)]' : ''}>{day}</div>
-                {isToday && !grade && (
+                <div className={isToday || hasBook || grade ? 'font-semibold text-[var(--ink)]' : ''}>{day}</div>
+                {isToday && !grade && !hasBook && (
                   <div className="text-[9px] uppercase tracking-wide text-[var(--copper)]">Today</div>
                 )}
                 {grade && <div className="text-[9px] mt-0.5 font-semibold">{grade.tag}</div>}
+                {!grade && hasBook && (
+                  <div className="text-[9px] mt-0.5 font-semibold uppercase tracking-wide">Book</div>
+                )}
               </button>
             );
           })}
         </div>
         <p className="mt-3 text-[11px] text-[var(--ink-mute)]">
-          Click a day for the post-day review. Double-click to open the book.
+          Book marks a saved day from Atlas, including history with no process score. Click to review it. Double-click to open it.
         </p>
       </section>
 
@@ -141,6 +153,11 @@ export function CalendarArchive({ days, onOpenDay, onReviewChange }: Props) {
             <p className="text-xs text-[var(--ink-mute)]">
               Score the session: were you focused, and did the plan hold?
             </p>
+            {dayHasBook(selectedDay) && !review.grade && (
+              <p className="text-xs text-[var(--ink)]">
+                This day has a saved book. It is tagged even without a process score.
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Process grade">
               {PROCESS_GRADES.map((g) => {
                 const on = review.grade === g.id;
@@ -177,6 +194,9 @@ export function CalendarArchive({ days, onOpenDay, onReviewChange }: Props) {
                 onChange={(e) => writeReview({ wentWrong: e.target.value })}
               />
             </label>
+            {reviewSync && (
+              <p className="text-[11px] font-data text-[var(--ink-mute)]">{reviewSync}</p>
+            )}
             <button type="button" className="btn-primary w-full" onClick={() => onOpenDay(selected)}>
               Open this day
             </button>

@@ -134,7 +134,7 @@ app.get('/api/days', ...requireUser, async (req, res, next) => {
       .collection('days')
       .find({ userSub: req.userSub }, { projection: { snapshotBytes: 0 } })
       .sort({ date: -1 })
-      .limit(400)
+      .limit(2000)
       .toArray();
     res.json({ days });
   } catch (err) {
@@ -150,6 +150,35 @@ app.get('/api/days/:date', ...requireUser, async (req, res, next) => {
     });
     if (!day) return res.status(404).json({ error: 'Day not found' });
     res.json({ day });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch('/api/days/:date/review', ...requireUser, async (req, res, next) => {
+  try {
+    const date = req.params.date;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    }
+    const now = new Date().toISOString();
+    const result = await getDb().collection('days').findOneAndUpdate(
+      { userSub: req.userSub, date },
+      {
+        $set: { review: req.body.review ?? null, updatedAt: now },
+        $setOnInsert: {
+          userSub: req.userSub,
+          date,
+          book: {},
+          plan: {},
+          metrics: {},
+          saved: false,
+          createdAt: now,
+        },
+      },
+      { upsert: true, returnDocument: 'after', includeResultMetadata: false }
+    );
+    res.json({ day: result });
   } catch (err) {
     next(err);
   }

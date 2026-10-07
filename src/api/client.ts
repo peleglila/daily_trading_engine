@@ -1,4 +1,4 @@
-import type { DayDocument } from '../types/dayBook';
+import type { DayDocument, DayReview } from '../types/dayBook';
 
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8787').replace(/\/$/, '');
 
@@ -45,6 +45,14 @@ export async function listDays(token: string): Promise<DayDocument[]> {
   if (!res.ok) throw new Error(await res.text());
   const json = await res.json();
   return (json.days || []) as DayDocument[];
+}
+
+export async function saveDayReview(date: string, review: DayReview, token: string): Promise<void> {
+  const res = await apiFetch(`/api/days/${date}/review`, token, {
+    method: 'PATCH',
+    body: JSON.stringify({ review }),
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 export async function saveDay(date: string, day: DayDocument, token: string): Promise<DayDocument> {
